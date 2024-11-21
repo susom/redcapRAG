@@ -57,17 +57,34 @@
 		}
 	],
 
+    "system-settings": [
+        {
+            "key": "enable-system-debug-logging",
+            "name": "<b>Enable Debug Logging (system-wide)</b><br><i>(optional)</i> Requires installation and configuration of emLogger",
+            "required": false,
+            "type": "checkbox"
+        },
+        {
+            "key": "use_redis",
+            "name": "Use Redis for RAG",
+            "required": false,
+            "type": "checkbox"
+        },
+        {
+            "key": "redis_server_address",
+            "name": "Redis Server Address<br><i>Required if 'Use Redis for RAG' is enabled</i>",
+            "required": false,
+            "type": "text"
+        },
+        {
+            "key": "redis_port",
+            "name": "Redis Port<br><i>Required if 'Use Redis for RAG' is enabled</i>",
+            "required": false,
+            "type": "text"
+        }
+    ],
 
-	"system-settings": [
-		{
-			"key": "enable-system-debug-logging",
-			"name": "<b>Enable Debug Logging (system-wide)</b><i>(optional)</i> Requires installation and configuration of emLogger",
-			"required": false,
-			"type": "checkbox"
-		}
-	],
-
-	"compatibility": {
+    "compatibility": {
 		"php-version-min": "",
 		"php-version-max": "",
 		"redcap-version-min": "",
