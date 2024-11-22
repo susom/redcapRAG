@@ -115,7 +115,8 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     public function redcap_module_system_enable($version) {
         try {
             \REDCapEntity\EntityDB::buildSchema($this->PREFIX);
-            $entityTypes = \REDCapEntity\EntityFactory::getInstance()->getEntityTypes();
+            $entityFactory = $this->getEntityFactory();
+            $entityTypes = $entityFactory->getInstance()->getEntityTypes();
             $this->emLog("Entity schema built. Available entity types: " . json_encode($entityTypes));
         } catch (\Exception $e) {
             $this->emError("Failed to build entity schema: " . $e->getMessage());
