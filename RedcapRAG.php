@@ -13,6 +13,8 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     private \Stanford\SecureChatAI\SecureChatAI $secureChatInstance;
     const SecureChatInstanceModuleName = 'secure_chat_ai';
 
+    private $entityFactory;
+
     public function __construct() {
         parent::__construct();
     }
@@ -84,11 +86,25 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                         'name' => 'Meta Timestamp',
                         'type' => 'text',
                         'required' => false,
-                    ]
+                    ],
+                    'hash' => [
+                        'name' => 'Hash',
+                        'type' => 'text',
+                        'required' => true,
+                        'description' => 'A unique hash for deduplication purposes.',
+                    ],
+                    'created' => [
+                        'name' => 'Created',
+                        'type' => 'integer',
+                        'required' => false, // It will be auto-generated
+                        'description' => 'Timestamp for when the record was created.',
+                    ],
+
                 ],
-            ]
+            ],
         ];
     }
+
 
     /**
      * Trigger schema build for the entity when the module is enabled.
@@ -106,6 +122,13 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         }
     }
 
+    private function getEntityFactory() {
+        if (!$this->entityFactory) {
+            $this->entityFactory = new \REDCapEntity\EntityFactory();
+        }
+        return $this->entityFactory;
+    }
+
     /**
      * Retrieve the embedding for the given text using SecureChat AI.
      *
@@ -114,14 +137,25 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
      */
     private function getEmbedding($text) {
         try {
+            // Call the embedding API
             $result = $this->getSecureChatInstance()->callAI("ada-002", array("input" => $text));
-            $this->emDebug("Generated embedding for content: " . substr($text, 0, 100));
-            return $result['data'][0]['embedding'];
+
+            // Log the response for debugging
+            // $this->emDebug("API response for embedding:", $result);
+
+            // Extract and return the embedding
+            if (isset($result['data'][0]['embedding'])) {
+                $this->emDebug("Generated embedding for content: " . substr($text, 0, 100));
+                return $result['data'][0]['embedding'];
+            } else {
+                $this->emError("Unexpected API response: " . json_encode($result));
+            }
         } catch (\Exception $e) {
             $this->emError("Failed to generate embedding: " . $e->getMessage());
-            return null;
         }
+        return null; // Return null if embedding generation fails
     }
+
 
     /**
      * Retrieve the most relevant documents from the context database.
@@ -153,7 +187,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 $redis = new \Redis();
                 $redis->connect($this->getSystemSetting('redis_server_address'), $this->getSystemSetting('redis_port'));
 
-                $key = "chatbot_contexts:$projectIdentifier";
+                $key = "vector_contextdb:$projectIdentifier";
                 $storedData = $redis->zRange($key, 0, -1);
 
                 foreach ($storedData as $entry) {
@@ -177,8 +211,9 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 $sql = 'SELECT id FROM `redcap_entity_generic_contextdb` WHERE project_identifier = "' . db_escape($projectIdentifier) . '"';
                 $result = db_query($sql);
 
+                $entityFactory = $this->getEntityFactory();
                 while ($row = db_fetch_assoc($result)) {
-                    $entity = $this->entityFactory->loadEntity('generic_contextdb', $row['id']);
+                    $entity = $entityFactory->getInstance('generic_contextdb', $row['id']);
                     $docEmbedding = json_decode($entity->getData()['vector_embedding'], true);
                     $similarity = $this->cosineSimilarity($queryEmbedding, $docEmbedding);
 
@@ -202,7 +237,8 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
             return $b['similarity'] <=> $a['similarity'];
         });
 
-        return array_slice($documents, 0, 3);
+        $top_matches = array_slice($documents, 0, 3);
+        return $top_matches;
     }
 
     /**
@@ -213,28 +249,43 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
      * @param string $content
      * @return void
      */
-    public function storeDocument($projectIdentifier, $title, $content) {
+    public function storeDocument($projectIdentifier, $title, $content, $dateCreated = null) {
         $embedding = $this->getEmbedding($content);
         if (!$embedding) {
             $this->emError("Failed to generate embedding for content.");
             return;
         }
         $serialized_embedding = json_encode($embedding);
+        $contentHash = hash('sha256', $content);
 
         if ($this->getSystemSetting('use_redis')) {
+            // Handle deduplication in Redis
             try {
                 $redis = new \Redis();
                 $redis->connect($this->getSystemSetting('redis_server_address'), $this->getSystemSetting('redis_port'));
 
-                $key = "chatbot_contexts:$projectIdentifier";
+                $key = "vector_contextdb:$projectIdentifier";
+
+                // Check for existing document with the same hash
+                $existingDocs = $redis->zRange($key, 0, -1);
+                foreach ($existingDocs as $doc) {
+                    $docData = json_decode($doc, true);
+                    if ($docData['hash'] === $contentHash) {
+                        $this->emDebug("Document already exists in Redis for project {$projectIdentifier}. Skipping.");
+                        return; // Skip storing duplicate
+                    }
+                }
+
+                // Add the document to Redis
                 if (!$redis->zAdd(
                     $key,
                     time(),
                     json_encode([
                         'title' => $title,
                         'content' => $content,
+                        'hash' => $contentHash,
                         'embedding' => $serialized_embedding,
-                        'timestamp' => time()
+                        'timestamp' => $dateCreated ?? time()
                     ])
                 )) {
                     $this->emError("Failed to add document to Redis for project {$projectIdentifier}");
@@ -243,26 +294,122 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 $this->emError("Failed to store document in Redis: " . $e->getMessage());
             }
         } else {
+            // Handle deduplication in the Entity Table
             try {
-                $entity = new \REDCapEntity\Entity($this->entityFactory, 'generic_contextdb');
-                $entity->setData([
+                $query = "SELECT id FROM redcap_entity_generic_contextdb
+                      WHERE project_identifier = ?
+                      AND hash = ?";
+                $params = [$projectIdentifier, $contentHash];
+                $result = $this->query($query, $params);
+
+                if ($result->num_rows > 0) {
+                    $this->emDebug("Document already exists in Entity Table for project {$projectIdentifier}. Skipping.");
+                    return; // Skip storing duplicate
+                }
+
+                // Store the document in the Entity Table
+//                $this->entityFactory = new \REDCapEntity\EntityFactory();
+                $entityFactory = $this->getEntityFactory();
+//                if (!$entityFactory) {
+//                    $this->emError("EntityFactory is not initialized. Cannot create entity.");
+//                    return;
+//                }
+
+                $entity = new \REDCapEntity\Entity($entityFactory, 'generic_contextdb');
+                $data = [
                     'project_identifier' => $projectIdentifier,
                     'content' => $content,
                     'content_type' => 'text',
+                    'vector_embedding' => $serialized_embedding,
+                    'hash' => $contentHash,// Store hash for deduplication
+
                     'file_url' => null,
                     'upvotes' => 0,
                     'downvotes' => 0,
                     'source' => $title,
-                    'vector_embedding' => $serialized_embedding,
                     'meta_summary' => null,
                     'meta_tags' => null,
                     'meta_timestamp' => date("Y-m-d H:i:s"),
-                ]);
-                $entity->save();
+
+                    // for some reason trying to set these 2 causes it to totally fail
+                    // 'created' => $dateCreated ? strtotime($dateCreated) : time(), // Use `strtotime` to convert date strings to Unix timestamps
+                    // 'updated' => time(),
+                ];
+
+                // $this->emDebug("Attempting to set data:", $data);
+                if (!$entity->setData($data)) {
+                    $this->emError("Set data failed:", $entity->getErrors());
+                } else {
+                    try {
+                        if ($entity->save()) {
+                            // $this->emDebug("Entity saved successfully.", $entity->getData());
+                        } else {
+                            $this->emError("Save failed.");
+                        }
+                    } catch (\Exception $e) {
+                        $this->emError("Entity save exception: " . $e->getMessage());
+                    }
+                }
             } catch (\Exception $e) {
                 $this->emError("Failed to store document in Entity Table: " . $e->getMessage());
             }
         }
+    }
+
+
+    /**
+     * Check for existing documents and store only if not already present.
+     *
+     * @param string $projectIdentifier
+     * @param string $title
+     * @param string $content
+     * @param string|null $dateCreated
+     */
+    public function checkAndStoreDocument(string $projectIdentifier, string $title, string $content, ?string $dateCreated = null): void {
+        $contentHash = $this->generateContentHash($content);
+
+        if ($this->getSystemSetting('use_redis')) {
+            try {
+                $redis = new \Redis();
+                $redis->connect($this->getSystemSetting('redis_server_address'), $this->getSystemSetting('redis_port'));
+
+                $key = "vector_contextdb:$projectIdentifier";
+
+                // Check for existing document with the same hash
+                $existingDocs = $redis->zRange($key, 0, -1);
+                foreach ($existingDocs as $doc) {
+                    $docData = json_decode($doc, true);
+                    if ($docData['hash'] === $contentHash) {
+                        $this->emDebug("Document already exists in Redis for project {$projectIdentifier}. Skipping.");
+                        return; // Skip storing duplicate
+                    }
+                }
+            } catch (\Exception $e) {
+                $this->emError("Failed to check document in Redis: " . $e->getMessage());
+            }
+        } else {
+            try {
+                $query = "SELECT id FROM redcap_entity_generic_contextdb
+                      WHERE project_identifier = ?
+                      AND hash = ?";
+                $params = [$projectIdentifier, $contentHash];
+                $result = $this->query($query, $params);
+
+                if ($result->num_rows > 0) {
+                    $this->emDebug("Document already exists in Entity Table for project {$projectIdentifier}. Skipping.");
+                    return; // Skip storing duplicate
+                }
+            } catch (\Exception $e) {
+                $this->emError("Failed to check document in Entity Table: " . $e->getMessage());
+            }
+        }
+
+        // If no duplicates, store the document
+        $this->storeDocument($projectIdentifier, $title, $content, $dateCreated);
+    }
+
+    private function generateContentHash($content) {
+        return hash('sha256', $content);
     }
 
     /**
