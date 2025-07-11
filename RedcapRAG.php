@@ -3,6 +3,20 @@ namespace Stanford\RedcapRAG;
 
 require_once "emLoggerTrait.php";
 
+$entityBase = dirname(__DIR__, 1) . '/redcap_entity_v9.9.9/classes/';
+require_once $entityBase . 'Page.php';
+require_once $entityBase . 'EntityFormTrait.php';   
+require_once $entityBase . 'Entity.php';
+require_once $entityBase . 'EntityFactory.php';
+require_once $entityBase . 'EntityDB.php';
+require_once $entityBase . 'EntityList.php';
+require_once $entityBase . 'EntityForm.php';
+require_once $entityBase . 'EntityQuery.php';
+require_once $entityBase . 'EntityDeleteForm.php';
+require_once $entityBase . 'SchemaManagerPage.php';
+require_once $entityBase . 'StatusMessageQueue.php';
+
+
 use \REDCapEntity\Entity;
 use \REDCapEntity\EntityDB;
 use \REDCapEntity\EntityFactory;

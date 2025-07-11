@@ -1,95 +1,137 @@
 # REDCapRAG External Module
 
-**REDCapRAG** is a powerful External Module for REDCap that enables Retrieval-Augmented Generation (RAG) functionality. This module allows REDCap administrators and users to store, query, and retrieve context documents using vector embeddings, enabling enhanced document search and retrieval within REDCap projects.
-
-The module integrates with AI models via the **SecureChatAI External Module** to generate embeddings and supports multiple backends for flexibility:
-- **Redis with Redis Search Module** for optimal performance.
-- **REDCap Entity Table** as a fallback for environments without Redis.
-
-## Features
-
-- **Create & Manage Collections**: Dynamically group context documents into logical collections for easy management.
-- **AI-Generated Embeddings**: Leverage **SecureChatAI** to generate high-quality vector embeddings for content.
-- **Semantic Search**: Query collections using vector similarity to retrieve relevant documents.
-- **Multiple Backend Support**:
-    - Redis (preferred) for fast and efficient vector search.
-    - REDCap Entity Table (fallback) for seamless integration in Redis-free environments.
-- **Developer-Friendly API**: Includes public functions for interaction with other REDCap External Modules.
-
-## Prerequisites
-
-- **REDCap**: Version 9.1.0 or higher.
-- **SecureChatAI External Module**: Installed and configured to handle embedding generation.
-- **Redis**: If using Redis as the backend (requires Redis Search Module).
-- **REDCap Entity Module**: Required for Entity Table support.
-
-## Installation
-
-1. Download and extract the module into your REDCap `modules` directory.
-2. Enable the module via the **External Modules** interface in REDCap.
-3. Configure your preferred backend:
-    - Redis: Ensure Redis and the Redis Search Module are installed and accessible.
-    - Entity Table: No additional setup required; the module will automatically use the Entity Table if Redis is unavailable.
-4. Install and configure the **SecureChatAI External Module** for embedding generation.
-
-## Usage
-
-### Public Functions
-Other REDCap External Modules can interact with REDCapRAG using these public functions:
-
-1. **`storeDocument($collection_name, $title, $content)`**:
-    - Stores a document in the specified collection with content and embeddings.
-
-2. **`getRelevantDocuments($collection_name, $query_text, $limit = 3)`**:
-    - Queries a collection for documents with the highest semantic similarity to the query text. Returns up to `$limit` results.
-
-### Data Structure (Entity Table Backend)
-When using the REDCap Entity Table backend, documents are stored with the following fields:
-
-- `collection_name`: Logical grouping of documents.
-- `content`: The document text.
-- `content_type`: Type of content (e.g., `text`).
-- `file_url`: Optional URL to a file associated with the document.
-- `upvotes` / `downvotes`: User ratings for relevance.
-- `source`: Source of the content.
-- `vector_embedding`: AI-generated embedding for the content.
-- `meta_summary`: Summary of the document.
-- `meta_tags`: Comma-separated tags for categorization.
-- `meta_timestamp`: Timestamp for the document.
-
-### Example Workflow
-1. Store a document:
-   ```php
-   $module->storeDocument('example_collection', 'Document Title', 'This is the document content.');
-2. Query for relevant documents:
-   ```php
-   $results = $module->getRelevantDocuments('example_collection', 'What is the best way to...?', 5);
-
-
-## Backend Selection
-
-### Redis (Recommended)
-- **Performance**: Optimized for fast retrieval of large datasets.
-- **Setup**: Requires Redis Search Module.
-
-### Entity Table (Fallback)
-- **Ease of Use**: No additional infrastructure required.
-- **Limitations**: Slower and less efficient compared to Redis.
+**REDCapRAG** is a modular External Module for [REDCap](https://projectredcap.org/) that enables **Retrieval-Augmented Generation (RAG)** workflows in any REDCap project. It allows you to store, index, and semantically search knowledge base documents using vector embeddings—powering smarter AI assistants, chatbots, and search tools in REDCap.
 
 ---
 
-## Developer Notes
+## **Key Features**
 
-- **Embedding Generation**: REDCapRAG uses SecureChatAI to generate vector embeddings.
-- **Fallback Logic**: If Redis is unavailable, the module seamlessly falls back to the Entity Table.
-- **Cosine Similarity**: Similarity calculations use embeddings for document matching.
+- **Pluggable Context Store:**  
+  Store arbitrary documents, summaries, or notes and retrieve them by semantic similarity (not just keyword match).
+
+- **Project-Based Collections:**  
+  Each project (or logical scope) has its own vector index for privacy and relevance.
+
+- **Flexible Backends:**  
+  - **Redis** (with Redis Search module): for fast, production-scale search  
+  - **REDCap Entity Table:** fallback for smaller projects or environments without Redis
+
+- **Embeddings Powered by SecureChatAI EM:**  
+  Embeddings are generated using the SecureChatAI EM, which can use any supported model (e.g., OpenAI Ada, GPT, DeepSeek, etc.).
+
+- **Cosine Similarity Search:**  
+  Document retrieval is based on vector math—finds the most semantically relevant context.
+
+- **Developer-Friendly Public API:**  
+  Expose `storeDocument`, `getRelevantDocuments`, etc. so *any* other EM or workflow can use RAG.
 
 ---
 
-## Known TODOs
+## **Why This Module?**
 
-- **Redis Integration**: Complete Redis connection logic and testing.
-- **Error Handling**: Improve handling of embedding retrieval failures.
-- **Schema Building**: Ensure `redcap_module_system_enable` initializes the database schema:
-  ```php
-  \REDCapEntity\EntityDB::buildSchema($this->PREFIX);
+- **Separation of Concerns:**  
+  - RAG manages context storage & search only.  
+  - SecureChatAI handles embedding generation and LLM API calls.  
+  - Chatbots (or any AI workflows) can consume RAG without pulling in chat-specific code.
+- **Composable:**  
+  Use RAG for chatbots, form assistance, research search, or any AI augmentation.
+
+---
+
+## Typical Workflow
+
+*You almost always access REDCapRAG from another External Module (EM) using a getter, **not** directly:*
+
+```php
+// Get the RAG EM instance via your main EM’s baseclass helper
+$rag = $module->getRedcapRAGInstance(); // or $this->getRedcapRAGInstance() in a class
+
+// Store a document for later retrieval
+$rag->storeDocument($projectIdentifier, $title, $content);
+
+// Retrieve relevant documents for a user query
+$results = $rag->getRelevantDocuments($projectIdentifier, $chatArray, 5);
+```
+
+- **Plug RAG into any Chatbot/AI EM:**  
+  - Example: Use RAG to fetch context for each user question in your chatbot, and inject into LLM prompt.
+
+---
+
+## **Public Functions (for other EMs)**
+
+- `storeDocument($projectIdentifier, $title, $content, $dateCreated = null)`  
+  Store a new document (auto-embeds and dedupes).
+
+- `getRelevantDocuments($projectIdentifier, $queryArray, $limit = 3)`  
+  Retrieve up to `$limit` most relevant docs for a query (pass in user message array).
+
+- `checkAndStoreDocument($projectIdentifier, $title, $content, $dateCreated = null)`  
+  Convenience function: only stores if unique.
+
+---
+
+## **Data Model (Entity Table backend)**
+
+- `project_identifier`: Project or logical scope for grouping.
+- `content`, `content_type`, `file_url`
+- `vector_embedding`: JSON-encoded vector from SecureChatAI
+- `source`, `meta_summary`, `meta_tags`, `meta_timestamp`
+- `hash`: SHA256 for deduplication
+- `upvotes`, `downvotes`: For user feedback (future relevance tuning)
+
+---
+
+## **Backend Selection**
+
+- **Redis (Recommended):**
+  - Fast, scalable, required for large or production setups.
+  - Needs Redis Search module enabled.
+- **Entity Table:**
+  - Built-in, slower, best for small or demo sites.
+
+---
+
+## **Installation**
+
+1. **Install SecureChatAI EM** and configure LLM/embedding endpoints.
+2. **Install Redis** (optional, for high performance).
+3. **Add REDCapRAG EM to your REDCap modules directory.**
+4. **Enable the module** in the REDCap External Modules admin UI.
+5. **Configure your backend** (choose Redis or fallback to Entity Table).
+6. **Build entity schema** (auto-runs when enabled).
+
+---
+
+## **FAQ / Gotchas**
+
+- **How does a chatbot (e.g., Cappy) use RAG?**  
+  It calls `getRelevantDocuments()` each time it needs context for an LLM call.
+
+- **How are embeddings generated?**  
+  RAG calls SecureChatAI EM to generate them—so you can swap embedding providers by updating SecureChatAI.
+
+- **What about relevance tuning?**  
+  Upvote/downvote fields are included for future expansion—user feedback loops, etc.
+
+---
+
+## **Developer Notes**
+
+- **Cosine similarity math is native PHP** for Entity Table; for Redis, you can implement server-side scoring.
+- **Batch processing and backend abstraction** are ready for future scaling.
+- **Public API is stable:** Use from any EM, service, or custom workflow.
+
+---
+
+## **See Also**
+
+- [SecureChatAI External Module](https://github.com/susom/secureChatAI) (embedding and LLM orchestration)
+- [REDCap Chatbot](https://github.com/susom/redcap-em-chatbot)
+
+---
+
+**Questions?**  
+Read the code, see the docblocks, or ping the maintainer—this module was built for future composability and developer sanity.
+
+---
