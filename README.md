@@ -1,10 +1,10 @@
 # REDCapRAG External Module
 
-**REDCapRAG** is a modular External Module for [REDCap](https://projectredcap.org/) that enables **Retrieval-Augmented Generation (RAG)** workflows in any REDCap project. It allows you to store, index, and semantically search knowledge base documents using vector embeddings—powering smarter AI assistants, chatbots, and search tools in REDCap.
+**REDCapRAG** is a modular External Module for REDCap that enables **Retrieval-Augmented Generation (RAG)** workflows in any REDCap project. It allows you to store, index, and semantically search knowledge base documents using vector embeddings—powering smarter AI assistants, chatbots, and search tools in REDCap.
 
 ---
 
-## **Key Features**
+## Key Features
 
 - **Pluggable Context Store:**  
   Store arbitrary documents, summaries, or notes and retrieve them by semantic similarity (not just keyword match).
@@ -27,7 +27,7 @@
 
 ---
 
-## **Why This Module?**
+## Why This Module?
 
 - **Separation of Concerns:**  
   - RAG manages context storage & search only.  
@@ -40,8 +40,6 @@
 
 ## Typical Workflow
 
-*You almost always access REDCapRAG from another External Module (EM) using a getter, **not** directly:*
-
 ```php
 // Get the RAG EM instance via your main EM’s baseclass helper
 $rag = $module->getRedcapRAGInstance(); // or $this->getRedcapRAGInstance() in a class
@@ -53,12 +51,15 @@ $rag->storeDocument($projectIdentifier, $title, $content);
 $results = $rag->getRelevantDocuments($projectIdentifier, $chatArray, 5);
 ```
 
-- **Plug RAG into any Chatbot/AI EM:**  
-  - Example: Use RAG to fetch context for each user question in your chatbot, and inject into LLM prompt.
+---
+
+## Plug RAG into any Chatbot/AI EM
+
+Example: Use RAG to fetch context for each user question in your chatbot, and inject into the LLM prompt.
 
 ---
 
-## **Public Functions (for other EMs)**
+## Public Functions (for other EMs)
 
 - `storeDocument($projectIdentifier, $title, $content, $dateCreated = null)`  
   Store a new document (auto-embeds and dedupes).
@@ -71,7 +72,7 @@ $results = $rag->getRelevantDocuments($projectIdentifier, $chatArray, 5);
 
 ---
 
-## **Data Model (Entity Table backend)**
+## Data Model (Entity Table backend)
 
 - `project_identifier`: Project or logical scope for grouping.
 - `content`, `content_type`, `file_url`
@@ -82,17 +83,18 @@ $results = $rag->getRelevantDocuments($projectIdentifier, $chatArray, 5);
 
 ---
 
-## **Backend Selection**
+## Backend Selection
 
-- **Redis (Recommended):**
-  - Fast, scalable, required for large or production setups.
-  - Needs Redis Search module enabled.
-- **Entity Table:**
-  - Built-in, slower, best for small or demo sites.
+**Redis (Recommended):**
+- Fast, scalable, required for large or production setups.
+- Needs Redis Search module enabled.
+
+**Entity Table:**
+- Built-in, slower, best for small or demo sites.
 
 ---
 
-## **Installation**
+## Installation
 
 1. **Install SecureChatAI EM** and configure LLM/embedding endpoints.
 2. **Install Redis** (optional, for high performance).
@@ -103,7 +105,52 @@ $results = $rag->getRelevantDocuments($projectIdentifier, $chatArray, 5);
 
 ---
 
-## **FAQ / Gotchas**
+## Running Redis (with Redis Search) Locally for REDCapRAG
+
+REDCapRAG supports a high-performance Redis backend out of the box.
+For development, you can spin up a Redis + Redis Search server (with browser UI!) in seconds using Docker Compose.
+
+### Quick Start: Docker Compose
+
+Add this to your `docker-compose.yml` or run it standalone:
+
+```yaml
+services:
+  redis:
+    image: redis/redis-stack:latest
+    container_name: redis-stack
+    ports:
+      - "6379:6379"    # Redis server port
+      - "8001:8001"    # RedisInsight UI (browser dashboard)
+    environment:
+      - REDIS_ARGS=--save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+```
+
+This runs Redis Stack with RedisSearch enabled and persistent data.
+
+Browse to http://localhost:8001 for the RedisInsight UI (explore keys, see embeddings, debug!)
+
+---
+
+### Configuring REDCapRAG to Use Your Local Redis
+
+**Redis Server Address:**
+
+- If REDCap’s webserver is running on the host, use: `localhost`
+- If REDCap is in Docker and Redis is running on the host or another container, use: `host.docker.internal`
+    - *Note: `host.docker.internal` lets a Docker container access services on the host machine. It works on Mac/Windows and recent Linux with Docker Desktop.*
+
+**Redis Port:**  
+`6379`
+
+---
+
+## FAQ / Gotchas
 
 - **How does a chatbot (e.g., Cappy) use RAG?**  
   It calls `getRelevantDocuments()` each time it needs context for an LLM call.
@@ -114,24 +161,27 @@ $results = $rag->getRelevantDocuments($projectIdentifier, $chatArray, 5);
 - **What about relevance tuning?**  
   Upvote/downvote fields are included for future expansion—user feedback loops, etc.
 
+- You can run Redis inside or outside your REDCap Docker stack.  
+  Just make sure ports are open, and point REDCapRAG at the right address (`host.docker.internal` for container-to-host).
+
+- Check RedisInsight for live data.  
+  If you see keys like `vector_contextdb:YOUR_PROJECT_ID`, ingestion is working!
+
+- If you see PHP errors like “Class ‘Redis’ not found”:  
+  You need to install the php-redis extension in your REDCap web container.
+
 ---
 
-## **Developer Notes**
+## Developer Notes
 
-- **Cosine similarity math is native PHP** for Entity Table; for Redis, you can implement server-side scoring.
-- **Batch processing and backend abstraction** are ready for future scaling.
-- **Public API is stable:** Use from any EM, service, or custom workflow.
+- Cosine similarity math is native PHP for Entity Table; for Redis, you can implement server-side scoring.
+- Batch processing and backend abstraction are ready for future scaling.
+- Public API is stable: Use from any EM, service, or custom workflow.
 
 ---
 
-## **See Also**
+## See Also
 
 - [SecureChatAI External Module](https://github.com/susom/secureChatAI) (embedding and LLM orchestration)
 - [REDCap Chatbot](https://github.com/susom/redcap-em-chatbot)
 
----
-
-**Questions?**  
-Read the code, see the docblocks, or ping the maintainer—this module was built for future composability and developer sanity.
-
----
