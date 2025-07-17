@@ -297,6 +297,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 }
 
                 // Add the document to Redis
+                $this->emDebug("adding RAG!",$title);
                 if (!$redis->zAdd(
                     $key,
                     time(),

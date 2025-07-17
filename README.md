@@ -167,10 +167,26 @@ Browse to http://localhost:8001 for the RedisInsight UI (explore keys, see embed
 - Check RedisInsight for live data.  
   If you see keys like `vector_contextdb:YOUR_PROJECT_ID`, ingestion is working!
 
-- If you see PHP errors like “Class ‘Redis’ not found”:  
-  You need to install the php-redis extension in your REDCap web container.
-
 ---
+
+## Required PHP Extensions / Dockerfile Changes
+
+If you are running REDCap in Docker (recommended for most modern deployments), you need to ensure the `php-redis` extension is installed in your REDCap web container. This is required for REDCapRAG to use Redis.
+
+**Update your Dockerfile** (or your docker-compose web build section) to include:
+
+```Dockerfile
+RUN pecl install redis \
+    && docker-php-ext-enable redis
+```    
+
+Rebuild and restart your REDCap web container after making this change.
+
+**Why?**
+
+- Without this, you'll get PHP errors like `Class 'Redis' not found` when the module tries to use Redis as a backend.
+- This step is required for any PHP code that needs Redis access.
+
 
 ## Developer Notes
 
