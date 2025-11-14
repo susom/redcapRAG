@@ -177,6 +177,48 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     }
 
 
+    private function pineconeUpsert($namespace, $vectors) {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+        $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
+
+        $client = new \GuzzleHttp\Client();
+
+        $resp = $client->post("$host/vectors/upsert", [
+            'headers' => [
+                'Api-Key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ],
+            'json' => [
+                'namespace' => $namespace,
+                'vectors' => $vectors
+            ]
+        ]);
+
+        return json_decode($resp->getBody(), true);
+    }
+
+    private function pineconeQuery($namespace, $embedding, $topK = 3) {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+        $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
+
+        $client = new \GuzzleHttp\Client();
+
+        $resp = $client->post("$host/query", [
+            'headers' => [
+                'Api-Key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ],
+            'json' => [
+                'topK' => $topK,
+                'includeMetadata' => true,
+                'namespace' => $namespace,
+                'vector' => $embedding
+            ]
+        ]);
+
+        return json_decode($resp->getBody(), true);
+    }
+
     /**
      * Retrieve the most relevant documents from the context database.
      *
@@ -202,28 +244,33 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
         $documents = [];
 
-        if ($this->getSystemSetting('use_redis')) {
+        if ($this->getSystemSetting('use_vectordb')) {
             try {
-                $redis = new \Redis();
-                $redis->connect($this->getSystemSetting('redis_server_address'), $this->getSystemSetting('redis_port'));
+                $namespace = $projectIdentifier;
 
-                $key = "vector_contextdb:$projectIdentifier";
-                $storedData = $redis->zRange($key, 0, -1);
+                $results = $this->pineconeQuery($namespace, $queryEmbedding, 3);
 
-                foreach ($storedData as $entry) {
-                    $document = json_decode($entry, true);
-                    $docEmbedding = json_decode($document['embedding'], true);
-                    $similarity = $this->cosineSimilarity($queryEmbedding, $docEmbedding);
+                if (!isset($results['matches']) || empty($results['matches'])) {
+                    return [];
+                }
+
+                foreach ($results['matches'] as $m) {
+                    $meta = $m['metadata'] ?? [];
 
                     $documents[] = [
-                        'title' => $document['title'],
-                        'content' => $document['content'],
-                        'similarity' => $similarity,
-                        'timestamp' => $document['timestamp']
+                        'id'            => $m['id'] ?? null,
+                        'content'       => $meta['content'] ?? '',
+                        'source'        => $meta['source'] ?? '',
+                        'meta_summary'  => $meta['meta_summary'] ?? null,
+                        'meta_tags'     => $meta['meta_tags'] ?? null,
+                        'meta_timestamp'=> $meta['timestamp'] ?? null,
+                        'similarity'    => $m['score'] ?? 0,
                     ];
                 }
+
+                return $documents;
             } catch (\Exception $e) {
-                $this->emError("Failed to fetch documents from Redis: " . $e->getMessage());
+                $this->emError("Pinecone query failed: " . $e->getMessage());
                 return null;
             }
         } else {
@@ -278,42 +325,25 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         $serialized_embedding = json_encode($embedding);
         $contentHash = hash('sha256', $content);
 
-        if ($this->getSystemSetting('use_redis')) {
-            // Handle deduplication in Redis
-            try {
-                $redis = new \Redis();
-                $redis->connect($this->getSystemSetting('redis_server_address'), $this->getSystemSetting('redis_port'));
+        if ($this->getSystemSetting('use_vectordb')) {
+            $namespace = $projectIdentifier;
 
-                $key = "vector_contextdb:$projectIdentifier";
+            $this->pineconeUpsert($namespace, [
+                [
+                    "id" => $contentHash,
+                    "values" => $embedding,
+                    "metadata" => [
+                        "title" => $title,
+                        "content" => $content,
+                        "source" => $title,
+                        "hash" => $contentHash,
+                        "timestamp" => $dateCreated ?? time(),
+                    ]
+                ]
+            ]);
 
-                // Check for existing document with the same hash
-                $existingDocs = $redis->zRange($key, 0, -1);
-                foreach ($existingDocs as $doc) {
-                    $docData = json_decode($doc, true);
-                    if ($docData['hash'] === $contentHash) {
-                        $this->emDebug("Document already exists in Redis for project {$projectIdentifier}. Skipping.");
-                        return; // Skip storing duplicate
-                    }
-                }
-
-                // Add the document to Redis
-                $this->emDebug("adding RAG!",$title);
-                if (!$redis->zAdd(
-                    $key,
-                    time(),
-                    json_encode([
-                        'title' => $title,
-                        'content' => $content,
-                        'hash' => $contentHash,
-                        'embedding' => $serialized_embedding,
-                        'timestamp' => $dateCreated ?? time()
-                    ])
-                )) {
-                    $this->emError("Failed to add document to Redis for project {$projectIdentifier}");
-                }
-            } catch (\Exception $e) {
-                $this->emError("Failed to store document in Redis: " . $e->getMessage());
-            }
+            $this->emDebug("Pinecone upserted chunk $contentHash in namespace $namespace");
+            return;
         } else {
             // Handle deduplication in the Entity Table
             try {
@@ -389,25 +419,40 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     public function checkAndStoreDocument(string $projectIdentifier, string $title, string $content, ?string $dateCreated = null): void {
         $contentHash = $this->generateContentHash($content);
 
-        if ($this->getSystemSetting('use_redis')) {
+        if ($this->getSystemSetting('use_vectordb')) {
+            $namespace = $projectIdentifier;
+            $docId = $contentHash;
+
+            // Check if vector exists
             try {
-                $redis = new \Redis();
-                $redis->connect($this->getSystemSetting('redis_server_address'), $this->getSystemSetting('redis_port'));
+                $apiKey = $this->getSystemSetting('pinecone_api_key');
+                $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
 
-                $key = "vector_contextdb:$projectIdentifier";
+                $client = new \GuzzleHttp\Client();
+                $resp = $client->post("$host/vectors/fetch", [
+                    'headers' => [
+                        'Api-Key' => $apiKey,
+                        'Content-Type' => 'application/json'
+                    ],
+                    'json' => [
+                        'namespace' => $namespace,
+                        'ids' => [$docId]
+                    ]
+                ]);
 
-                // Check for existing document with the same hash
-                $existingDocs = $redis->zRange($key, 0, -1);
-                foreach ($existingDocs as $doc) {
-                    $docData = json_decode($doc, true);
-                    if ($docData['hash'] === $contentHash) {
-                        $this->emDebug("Document already exists in Redis for project {$projectIdentifier}. Skipping.");
-                        return; // Skip storing duplicate
-                    }
+                $body = json_decode($resp->getBody(), true);
+
+                if (isset($body['vectors'][$docId])) {
+                    $this->emDebug("Document already exists in Pinecone for {$namespace}. Skipping.");
+                    return;
                 }
             } catch (\Exception $e) {
-                $this->emError("Failed to check document in Redis: " . $e->getMessage());
+                $this->emError("Pinecone fetch failed: " . $e->getMessage());
             }
+
+            // Store if not found
+            $this->storeDocument($projectIdentifier, $title, $content, $dateCreated);
+            return;
         } else {
             try {
                 $query = "SELECT id FROM redcap_entity_generic_contextdb

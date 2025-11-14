@@ -65,20 +65,26 @@
             "type": "checkbox"
         },
         {
-            "key": "use_redis",
-            "name": "Use Redis for RAG",
+            "key": "use_vectordb",
+            "name": "Use Vector Database (Pinecone) for RAG",
             "required": false,
             "type": "checkbox"
         },
         {
-            "key": "redis_server_address",
-            "name": "Redis Server Address<br><i>Required if 'Use Redis for RAG' is enabled</i>",
+            "key": "pinecone_host",
+            "name": "Pinecone Host Endpoint <br><i>Required if Vector DB is enabled</i>",
             "required": false,
             "type": "text"
         },
         {
-            "key": "redis_port",
-            "name": "Redis Port<br><i>Required if 'Use Redis for RAG' is enabled</i>",
+            "key": "pinecone_index",
+            "name": "Pinecone Index Name <br><i>Required if Vector DB is enabled</i>",
+            "required": false,
+            "type": "text"
+        },
+        {
+            "key": "pinecone_api_key",
+            "name": "Pinecone API Key <br><i>Required if Vector DB is enabled</i>",
             "required": false,
             "type": "text"
         }
