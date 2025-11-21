@@ -1,185 +1,179 @@
 # REDCap RAG External Module (RedcapRAG)
 
-This module provides a hybrid RAG (Retrieval-Augmented Generation) layer for REDCap projects. It allows you to ingest text, PDF-derived chunks, or custom context data and retrieve them using **dense semantic vectors**, **sparse keyword vectors**, or a **hybrid of both** using Pinecone.
+This module provides a hybrid Retrieval-Augmented Generation (RAG) layer for REDCap. It supports storing text documents with both dense embeddings and sparse keyword vectors, and retrieving them through a hybrid weighted search pipeline. The system can operate using Pinecone as a vector database or fall back to REDCap Entity storage.
 
 ---
 
 ## Features
 
-### **1. Hybrid Vector Search (Dense + Sparse)**
+### 1. Hybrid Vector Search (Dense + Sparse)
+- Dense semantic search via OpenAI embeddings  
+- Sparse keyword search via TF-based hashing  
+- Hybrid scoring with configurable dense/sparse weights  
+- Top-K selection applied after merging
 
-* Dense semantic search via embeddings
-* Sparse keyword search via TF-based hashing
-* Automated hybrid scoring with configurable weights
-* Post-merge top‑K selection for accuracy
+### 2. Two Storage Modes
+- Vector DB Mode (Pinecone): full dense+sparse hybrid retrieval  
+- MySQL Entity Mode: fallback cosine-similarity engine  
 
-### **2. Two Storage Modes**
+### 3. Namespace Isolation
+Each REDCap project (or logical scope) defines a:
 
-* **Vector DB mode (Pinecone)** – full hybrid retrieval
-* **MySQL Entity mode** – fallback when Pinecone is disabled
+```
+project_rag_project_identifier
+```
 
-### **3. RAG Namespace Isolation**
 
-Each REDCap project can define its own:
+Used as the Pinecone namespace or MySQL partition.
 
-* `project_rag_project_identifier`
+### 4. Document Deduplication
+Documents use a stable SHA-256 hash to prevent duplicates from being inserted.
 
-This value becomes the Pinecone namespace or MySQL partition.
+### 5. Admin Debug Panel (New)
 
-### **4. Deduplication**
+A standalone system page for module administrators:
 
-Documents use a stable SHA‑256 hash to avoid re‑inserting duplicates.
+Location:  
+Control Center → External Modules → REDCap RAG → RAG Debug
 
-### **5. Admin Debug Panel**
+Capabilities:
+- Enter a namespace (project identifier) and run test queries  
+- Inspect per-document scores:  
+  - Dense score  
+  - Sparse score  
+  - Hybrid score  
+- Color-coded score heat mapping  
+- Sortable result table  
+- Collapsible full-content preview  
+- Delete individual vectors  
+- Purge an entire namespace  
+- List all stored documents in the namespace  
+- View sparse/dense-only mismatches if using hybrid mode  
 
-Allows you to:
-
-* Search vectors
-* Inspect dense/sparse scores
-* Delete individual vectors
-* Purge entire namespaces
-* View and manage stored documents
-
-### **6. Zero‑Vector Namespace Listing**
-
-Serverless Pinecone hosts are auto-detected and skipped since they do not support listing.
+This page mirrors the Chatbot EM's debugging console but is dedicated to RAG operations.
 
 ---
 
 ## Installation
 
-1. Place the module directory inside:
+1. Place the module folder into:
 
 ```
 /redcap/modules/redcap_rag_vX.X.X/
 ```
 
-2. Enable the module in **Control Center → External Modules**.
 
-3. Configure required settings:
+2. Enable the module in:  
+Control Center → External Modules.
 
-### **Required (Vector DB mode)**
+3. Configure the following system settings.
 
-* Pinecone API Key
-* Pinecone Dense Host (serverless)
-* Pinecone Sparse Host (pod index)
-* Enable: `use_vectordb`
+### Vector DB Mode (Pinecone)
+Required:
+- Pinecone API Key  
+- Pinecone Dense Host (serverless)  
+- Pinecone Sparse Host (pod index)  
+- Enable: use_vectordb  
+- Hybrid weights:  
+  - hybrid_dense_weight  
+  - hybrid_sparse_weight
 
-### **Required (Both modes)**
-
-* `project_rag_project_identifier`
+### All Modes
+- project_rag_project_identifier
 
 ---
 
 ## Key Concepts
 
-### **Dense Embeddings (Semantic)**
+### Dense Embeddings
+Generated through SecureChatAI using model ada-002.
 
-Generated through SecureChatAI using model `ada-002`.
+### Sparse Vectors
+- Simple tokenizer  
+- Term-frequency normalized (TF/maxTF)  
+- Stable hashed indices via crc32(term) % 200000  
+- Upserted into Pinecone’s sparse pod index
 
-### **Sparse Vectors (Keywords)**
-
-Lightweight TF hash-based:
-
-* tokenizes text
-* computes normalized term frequency
-* assigns stable indices via `crc32(term) % 200000`
-
-### **Hybrid Merging**
-
-Scores are normalized and combined:
+### Hybrid Merge Process
+1. Collect all unique document IDs  
+2. Normalize sparse scores using log-scaling  
+3. Weighted hybrid scoring:  
 
 ```
 hybrid = (dense_weight * denseScore) + (sparse_weight * sparseScore)
 ```
 
-Top‑K is applied *after* merging.
+
+4. Sort  
+5. Slice to top-K  
 
 ---
 
-## 📘 Public Methods
+## Public Methods
 
-### `storeDocument($projectId, $title, $content, $dateCreated)`
+### storeDocument($projectId, $title, $content, $dateCreated)
+Stores a document and generates dense + sparse vectors.
 
-Stores a document with embedding and sparse vector.
+### checkAndStoreDocument(...)
+Deduplication wrapper; prevents re-inserting identical content.
 
-### `checkAndStoreDocument(...)`
+### getRelevantDocuments($projectId, $messages, $topK)
+Retrieves context for SecureChatAI calls.
 
-Deduplicates by SHA‑256 and only stores if missing.
+### debugSearchContext($projectId, $query, $topK)
+Used by the Admin Debug Panel for test queries.
 
-### `getRelevantDocuments($projectId, $messages, $topK)`
+### listContextDocuments($projectId)
+Lists documents for a namespace.
 
-Retrieves RAG context for SecureChatAI calls.
+### deleteContextDocument($projectId, $id)
+Deletes a vector from both dense and sparse Pinecone indexes.
 
-### `debugSearchContext($projectId, $query, $topK)`
-
-Used by the admin panel debug tool.
-
-### `listContextDocuments($projectId)`
-
-List all documents belonging to a namespace.
-
-### `deleteContextDocument($projectId, $id)`
-
-Delete a single document.
-
-### `purgeContextNamespace($projectId)`
-
-Delete *all* vectors for a namespace.
+### purgeContextNamespace($projectId)
+Clears the entire namespace.
 
 ---
 
-## 🛠 Internal Mechanics
+## Admin Debug Panel (Details)
 
-### Embeddings
+A full-featured inspection tool for system admins.
 
-Uses SecureChatAI → OpenAI embeddings via:
+Access:  
+Control Center → External Modules → REDCap RAG → RAG Debug
 
-```
-callAI("ada-002", ["input" => $text])
-```
+Functions:
+- Enter namespace manually (useful for projects, test spaces, multi-tenant setups)
+- Run test vector searches
+- Inspect dense, sparse, and hybrid contributions numerically
+- Heat-mapped scoring columns
+- Expand row → view full stored content
+- Delete a single vector
+- Purge entire namespace (requires manual confirmation)
+- List all stored vectors (dense and sparse)
 
-### Sparse Upserts
-
-Sent to Pinecone pod index for keyword augmentation.
-
-### Hybrid Merge
-
-1. Collect all unique IDs
-2. Normalize sparse (log scale)
-3. Weighted combine
-4. Sort
-5. Slice to top‑K
+Intended Uses:
+- Troubleshooting hybrid weighting  
+- Verifying ingestion correctness  
+- Ensuring dedupe is functioning  
+- Manually managing small knowledge bases  
+- QA before enabling RAG for production chatbots  
 
 ---
 
 ## Security Notes
-
-* All admin actions require REDCap user permissions
-* CSRF tokens included in all write operations
-* No PHI is stored unless sources include it explicitly
-
----
-
-## License
-
-Internal Stanford Research IT use unless otherwise specified.
+- All admin functions require REDCap authentication  
+- CSRF tokens applied to all write operations  
+- No PHI is stored unless provided by the source documents  
 
 ---
 
-If you’d like, I can also generate:
+## MySQL Fallback Mode
 
-* A **Bootstrap-styled Debug UI** README screenshots section
-* An "Advanced Setup" section for multi-agent pipelines
-* A "Troubleshooting" section (Pinecone issues, namespace confusion, etc.)
+If Pinecone is disabled:
 
-## MySQL Fallback Path
+- Embeddings stored as JSON via REDCap Entity  
+- Cosine similarity used for ranking  
+- No sparse/hybrid scoring  
+- Recommended only for small corpora or development environments  
 
-If Pinecone is disabled or unavailable, the module automatically falls back to REDCap Entity storage (`redcap_entity_generic_contextdb`).
-
-* Computes cosine similarity over stored JSON embeddings
-* No additional configuration required
-* Ideal for dev/local or restricted environments
-* Recommended for small corpora (<5k docs)
-
-When fallback activates, logs show: `debugSearchContext Entity fallback`.
+Fallback mode activates automatically and is visible in debug logs.

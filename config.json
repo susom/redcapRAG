@@ -40,7 +40,11 @@
 
 		],
 		"control-center": [
-
+            {
+                "name": "RAG Debug",
+                "icon": "fas fa-database",
+                "url": "pages/ragit.php"
+            }
 		]
 	},
 
@@ -95,12 +99,6 @@
             "type": "text",
             "required": false,
             "default": "0.4"
-        },
-        {
-            "key": "pinecone_index",
-            "name": "Pinecone Index Name <br><i>Required if Vector DB is enabled</i>",
-            "required": false,
-            "type": "text"
         },
         {
             "key": "pinecone_api_key",
