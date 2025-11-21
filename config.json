@@ -72,9 +72,29 @@
         },
         {
             "key": "pinecone_host",
-            "name": "Pinecone Host Endpoint <br><i>Required if Vector DB is enabled</i>",
+            "name": "Pinecone Host (Dense) Endpoint <br><i>Required if Vector DB is enabled</i>",
             "required": false,
             "type": "text"
+        },
+        {
+            "key": "pinecone_host_sparse",
+            "name": "Pinecone Host (Sparse) Endpoint <br><i>Required if Vector DB is enabled</i>",
+            "required": false,
+            "type": "text"
+        },
+        {
+            "key": "hybrid_dense_weight",
+            "name": "Hybrid Search: Dense Weight (0–1)",
+            "type": "text",
+            "required": false,
+            "default": "0.6"
+            },
+        {
+            "key": "hybrid_sparse_weight",
+            "name": "Hybrid Search: Sparse Weight (0–1)",
+            "type": "text",
+            "required": false,
+            "default": "0.4"
         },
         {
             "key": "pinecone_index",

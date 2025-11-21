@@ -119,6 +119,12 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         ];
     }
 
+    private function getEntityFactory() {
+        if (!$this->entityFactory) {
+            $this->entityFactory = new \REDCapEntity\EntityFactory($this->PREFIX); 
+        }
+        return $this->entityFactory;
+    }
 
     /**
      * Trigger schema build for the entity when the module is enabled.
@@ -142,18 +148,11 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         }
     }
 
-    private function getEntityFactory() {
-        if (!$this->entityFactory) {
-            $this->entityFactory = new \REDCapEntity\EntityFactory($this->PREFIX); 
-        }
-        return $this->entityFactory;
-    }
+
+
 
     /**
-     * Retrieve the embedding for the given text using SecureChat AI.
-     *
-     * @param string $text
-     * @return array|null
+     * 
      */
     private function getEmbedding($text) {
         try {
@@ -176,49 +175,6 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         return null; // Return null if embedding generation fails
     }
 
-
-    private function pineconeUpsert($namespace, $vectors) {
-        $apiKey = $this->getSystemSetting('pinecone_api_key');
-        $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
-
-        $client = new \GuzzleHttp\Client();
-
-        $resp = $client->post("$host/vectors/upsert", [
-            'headers' => [
-                'Api-Key' => $apiKey,
-                'Content-Type' => 'application/json'
-            ],
-            'json' => [
-                'namespace' => $namespace,
-                'vectors' => $vectors
-            ]
-        ]);
-
-        return json_decode($resp->getBody(), true);
-    }
-
-    private function pineconeQuery($namespace, $embedding, $topK = 3) {
-        $apiKey = $this->getSystemSetting('pinecone_api_key');
-        $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
-
-        $client = new \GuzzleHttp\Client();
-
-        $resp = $client->post("$host/query", [
-            'headers' => [
-                'Api-Key' => $apiKey,
-                'Content-Type' => 'application/json'
-            ],
-            'json' => [
-                'topK' => $topK,
-                'includeMetadata' => true,
-                'namespace' => $namespace,
-                'vector' => $embedding
-            ]
-        ]);
-
-        return json_decode($resp->getBody(), true);
-    }
-
     /**
      * Retrieve the most relevant documents from the context database.
      *
@@ -226,7 +182,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
      * @param array $queryArray
      * @return array|null
      */
-    public function getRelevantDocuments($projectIdentifier, $queryArray) {
+    public function getRelevantDocuments($projectIdentifier, $queryArray, $topK=3) {
         if (!is_array($queryArray) || empty($queryArray)) {
             return null;
         }
@@ -242,19 +198,37 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
             return null;
         }
 
+        // sparse query vector for hybrid
+        $sparseQuery = $this->generateSparseVector($query);
+
         $documents = [];
 
-        if ($this->getSystemSetting('use_vectordb')) {
+        if ($this->isVectorDbEnabled()) {
             try {
                 $namespace = $projectIdentifier;
 
-                $results = $this->pineconeQuery($namespace, $queryEmbedding, 3);
-
-                if (!isset($results['matches']) || empty($results['matches'])) {
-                    return [];
+                // --- Dense semantic search ---
+                $denseResults = [];
+                try {
+                    $denseResults = $this->pineconeQuery($namespace, $queryEmbedding, $topK);
+                } catch (\Exception $e) {
+                    $this->emError("Dense query failed: ".$e->getMessage());
                 }
 
-                foreach ($results['matches'] as $m) {
+                // --- Sparse keyword search ---
+                $sparseResults = [];
+                try {
+                    $sparseResults = $this->pineconeSparseQuery($namespace, $sparseQuery, $topK);
+                } catch (\Exception $e) {
+                    $this->emError("Sparse query failed: ".$e->getMessage());
+                }
+
+                // Normalize and combine
+                $combined = $this->mergeHybridResults($denseResults, $sparseResults , $topK);
+
+                // Format top matches
+                $documents = [];
+                foreach ($combined as $m) {
                     $meta = $m['metadata'] ?? [];
 
                     $documents[] = [
@@ -264,11 +238,14 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                         'meta_summary'  => $meta['meta_summary'] ?? null,
                         'meta_tags'     => $meta['meta_tags'] ?? null,
                         'meta_timestamp'=> $meta['timestamp'] ?? null,
-                        'similarity'    => $m['score'] ?? 0,
+                        'dense'         => $m['dense_score']  ?? null,
+                        'sparse'        => $m['sparse_score'] ?? null,
+                        'similarity'    => $m['hybrid_score'] ?? 0,
                     ];
                 }
 
                 return $documents;
+
             } catch (\Exception $e) {
                 $this->emError("Pinecone query failed: " . $e->getMessage());
                 return null;
@@ -304,8 +281,67 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
             return $b['similarity'] <=> $a['similarity'];
         });
 
-        $top_matches = array_slice($documents, 0, 3);
+        $top_matches = array_slice($documents, 0, $topK);
         return $top_matches;
+    }
+
+    private function mergeHybridResults($dense, $sparse, $topK = 3) {
+        $merged = [];
+
+        // Dense map (id => score)
+        $denseMap = [];
+        foreach (($dense['matches'] ?? []) as $m) {
+            $denseMap[$m['id']] = $m['score'];
+        }
+        $this->emDebug("Dense map", $denseMap);
+
+        // Sparse map (id => score)
+        $sparseMap = [];
+        foreach (($sparse['matches'] ?? []) as $m) {
+            $sparseNorm = log(1 + $m['score']);  
+            $sparseMap[$m['id']] = $sparseNorm;
+        }
+        $this->emDebug("Sparse map", $sparseMap);
+
+        // All IDs merged
+        $allIds = array_unique(array_merge(array_keys($denseMap), array_keys($sparseMap)));
+        $this->emDebug("All unique IDs", $allIds);
+
+        $wDense  = floatval($this->getSystemSetting('hybrid_dense_weight') ?? 0.6);
+        $wSparse = floatval($this->getSystemSetting('hybrid_sparse_weight') ?? 0.4);
+
+        foreach ($allIds as $id) {
+            $d = $denseMap[$id]  ?? 0;
+            $s = $sparseMap[$id] ?? 0;
+
+            // Hybrid weighting
+            $hybrid = ($wDense * $d) + ($wSparse * $s);
+
+            // Metadata retrieval
+            $metaDense = null;
+            foreach (($dense['matches'] ?? []) as $m) {
+                if ($m['id'] === $id) $metaDense = $m;
+            }
+
+            $metaSparse = null;
+            foreach (($sparse['matches'] ?? []) as $m) {
+                if ($m['id'] === $id) $metaSparse = $m;
+            }
+
+            $chosen = $metaDense ?? $metaSparse;
+            $chosen['hybrid_score'] = $hybrid;
+            $chosen['dense_score']  = $d;
+            $chosen['sparse_score'] = $s;
+            $chosen['similarity']   = $hybrid;
+
+            $merged[] = $chosen;
+        }
+
+        // Sort by hybrid_score
+        usort($merged, fn($a,$b) => ($b['hybrid_score'] <=> $a['hybrid_score']));
+        $merged = array_slice($merged, 0, $topK);
+        $this->emDebug("Final merged (sorted)", $merged);
+        return $merged;
     }
 
     /**
@@ -325,18 +361,36 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         $serialized_embedding = json_encode($embedding);
         $contentHash = hash('sha256', $content);
 
-        if ($this->getSystemSetting('use_vectordb')) {
+        if ($this->isVectorDbEnabled()) {
             $namespace = $projectIdentifier;
 
+            $sparse = $this->generateSparseVector($content);
+
+            // Dense upsert (serverless)
             $this->pineconeUpsert($namespace, [
                 [
-                    "id" => $contentHash,
+                    "id"     => $contentHash,
                     "values" => $embedding,
                     "metadata" => [
-                        "title" => $title,
-                        "content" => $content,
-                        "source" => $title,
-                        "hash" => $contentHash,
+                        "title"     => $title,
+                        "content"   => $content,
+                        "source"    => $title,
+                        "hash"      => $contentHash,
+                        "timestamp" => $dateCreated ?? time(),
+                    ]
+                ]
+            ]);
+
+            // Sparse upsert (pod index)
+            $this->pineconeSparseUpsert($namespace, [
+                [
+                    "id"           => $contentHash,
+                    "sparse_values"=> $sparse,
+                    "metadata"     => [
+                        "title"     => $title,
+                        "content"   => $content,
+                        "source"    => $title,
+                        "hash"      => $contentHash,
                         "timestamp" => $dateCreated ?? time(),
                     ]
                 ]
@@ -358,13 +412,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                     return; // Skip storing duplicate
                 }
 
-                // Store the document in the Entity Table
-//                $this->entityFactory = new \REDCapEntity\EntityFactory();
                 $entityFactory = $this->getEntityFactory();
-//                if (!$entityFactory) {
-//                    $this->emError("EntityFactory is not initialized. Cannot create entity.");
-//                    return;
-//                }
 
                 $entity = new \REDCapEntity\Entity($entityFactory, 'generic_contextdb');
                 $data = [
@@ -419,7 +467,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     public function checkAndStoreDocument(string $projectIdentifier, string $title, string $content, ?string $dateCreated = null): void {
         $contentHash = $this->generateContentHash($content);
 
-        if ($this->getSystemSetting('use_vectordb')) {
+        if ($this->isVectorDbEnabled()) {
             $namespace = $projectIdentifier;
             $docId = $contentHash;
 
@@ -508,6 +556,640 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
         return $dotProduct / ($normVec1 * $normVec2);
     }
+
+
+
+
+    /**
+     * Check if vector DB (Pinecone) is enabled in system settings.
+     *
+     * @return bool
+     */
+    private function isVectorDbEnabled(): bool
+    {
+        return (bool)$this->getSystemSetting('use_vectordb');
+    }
+
+    private function generateSparseVector(string $text): array {
+        // Basic tokenizer
+        $words = preg_split('/\W+/u', strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
+        if (empty($words)) {
+            return ['indices' => [], 'values' => []];
+        }
+
+        // Term frequency map
+        $freq = [];
+        foreach ($words as $w) {
+            if (!isset($freq[$w])) $freq[$w] = 0;
+            $freq[$w]++;
+        }
+
+        // Normalize weights
+        $maxFreq = max($freq);
+        $indices = [];
+        $values = [];
+
+        foreach ($freq as $term => $count) {
+            $weight = $count / $maxFreq;
+
+            // Convert term → stable “sparse index”
+            // Use crc32 mod large prime (Pinecone recommends <= 2^32)
+            $idx = crc32($term) % 200000; // keep it small-ish for now
+
+            $indices[] = $idx;
+            $values[]  = $weight;
+        }
+
+        return [
+            'indices' => $indices,
+            'values' => $values
+        ];
+    }
+
+    private function pineconeSparseUpsert($namespace, $vectors) {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+        $host   = rtrim($this->getSystemSetting('pinecone_host_sparse'), '/');
+
+        $client = new \GuzzleHttp\Client();
+
+        $resp = $client->post("$host/vectors/upsert", [
+            'headers' => [
+                'Api-Key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ],
+            'json' => [
+                'namespace' => $namespace,
+                'vectors'   => $vectors
+            ]
+        ]);
+
+        return json_decode($resp->getBody(), true);
+    }
+
+    private function pineconeSparseQuery($namespace, array $sparseVector, $topK = 3) {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+        $host   = rtrim($this->getSystemSetting('pinecone_host_sparse'), '/');
+
+        $client = new \GuzzleHttp\Client();
+
+        $body = [
+            'topK'            => $topK,
+            'namespace'       => $namespace,
+            'includeMetadata' => true,
+            'sparseVector'    => $sparseVector,
+        ];
+
+        $resp = $client->post("$host/query", [
+            'headers' => [
+                'Api-Key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ],
+            'json' => $body
+        ]);
+
+        return json_decode($resp->getBody(), true);
+    }
+
+    private function pineconeUpsert($namespace, $vectors) {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+        $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
+
+        $client = new \GuzzleHttp\Client();
+
+        $resp = $client->post("$host/vectors/upsert", [
+            'headers' => [
+                'Api-Key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ],
+            'json' => [
+                'namespace' => $namespace,
+                'vectors' => $vectors
+            ]
+        ]);
+
+        return json_decode($resp->getBody(), true);
+    }
+
+    private function pineconeQuery($namespace, $embedding, $topK = 3) {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+        $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
+
+        $client = new \GuzzleHttp\Client();
+
+        $body = [
+            'topK'            => $topK,
+            'includeMetadata' => true,
+            'namespace'       => $namespace,
+            'vector'          => $embedding,
+        ];
+
+        $resp = $client->post("$host/query", [
+            'headers' => [
+                'Api-Key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ],
+            'json' => $body
+        ]);
+
+        return json_decode($resp->getBody(), true);
+    }
+
+    private function pineconeRequestCustomHost(string $host, string $path, array $payload, string $method = 'POST'): array {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+
+        $client = new \GuzzleHttp\Client();
+        $resp = $client->request($method, rtrim($host,'/').$path, [
+            'headers' => [
+                'Api-Key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ],
+            'json' => $payload
+        ]);
+
+        return json_decode($resp->getBody(), true);
+    }
+
+    /**
+     * Generic internal helper to call Pinecone JSON APIs.
+     *
+     * @param string $path
+     * @param array  $payload
+     * @param string $method
+     * @return array
+     * @throws \Exception
+     */
+    private function pineconeRequest(string $path, array $payload, string $method = 'POST'): array
+    {
+        $apiKey = $this->getSystemSetting('pinecone_api_key');
+        $host   = rtrim((string)$this->getSystemSetting('pinecone_host'), '/');
+
+        if (empty($apiKey) || empty($host)) {
+            throw new \Exception("Pinecone API key or host is not configured.");
+        }
+
+        $client = new \GuzzleHttp\Client();
+        $url    = $host . $path;
+
+        $options = [
+            'headers' => [
+                'Api-Key'      => $apiKey,
+                'Content-Type' => 'application/json',
+            ],
+            'json'    => $payload,
+        ];
+
+        $response = $client->request($method, $url, $options);
+        $body     = (string)$response->getBody();
+
+        $decoded = json_decode($body, true);
+        if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+            throw new \Exception("Failed to decode Pinecone response: " . json_last_error_msg());
+        }
+
+        return $decoded;
+    }
+
+
+    /**
+     * List all context documents for a given project identifier / namespace.
+     * In vector DB mode this lists Pinecone vectors; otherwise it lists entity rows.
+     *
+     * @param string $projectIdentifier
+     * @param int    $limit
+     * @return array
+     */
+    public function listContextDocuments(string $projectIdentifier, int $limit = 5000): array
+    {
+        $docs = [];
+
+        if ($this->isVectorDbEnabled()) {
+            try {
+                $namespace = $projectIdentifier;
+
+                // 1) Get namespace stats
+                $payload = [ 'filter' => null ]; // optional
+                $stats   = $this->pineconeRequest('/describe_index_stats', $payload, 'POST');
+
+                if (!isset($stats['namespaces'][$namespace])) {
+                    return [];
+                }
+                $count = $stats['namespaces'][$namespace]['vectorCount'] ?? 0;
+                if ($count === 0) {
+                    return [];
+                }
+
+
+                // 2) Use zero-vector query to pull items
+                $fakeVector = array_fill(0, 1536, 0.0);
+                $limit = min($limit, $count);
+
+                $results = $this->pineconeRequest('/query', [
+                    'namespace' => $namespace,
+                    'topK'      => $limit,
+                    'vector'    => $fakeVector,
+                    'includeMetadata' => true
+                ], 'POST');
+
+                if (!isset($results['matches']) || empty($results['matches'])) {
+                    return [];
+                }
+
+                foreach ($results['matches'] as $m) {
+                    $meta = $m['metadata'] ?? [];
+                    $docs[] = [
+                        'id'      => $m['id'] ?? null,
+                        'content' => $meta['content'] ?? '',
+                        'source'  => $meta['source'] ?? '',
+                        'meta_summary'  => $meta['meta_summary'] ?? null,
+                        'meta_tags'     => $meta['meta_tags'] ?? null,
+                        'meta_timestamp'=> $meta['timestamp'] ?? null,
+                    ];
+                }
+            } catch (\Exception $e) {
+                $this->emError("listContextDocuments Pinecone error: " . $e->getMessage());
+            }
+
+            return $docs;
+        }
+
+        // Entity / MySQL fallback
+        try {
+            $sql = "
+                SELECT id, content, source, meta_summary, meta_tags, meta_timestamp
+                FROM redcap_entity_generic_contextdb
+                WHERE project_identifier = ?
+                ORDER BY id DESC
+                LIMIT ?
+            ";
+            $params = [$projectIdentifier, $limit];
+
+            $result = $this->query($sql, $params);
+            while ($row = db_fetch_assoc($result)) {
+                $docs[] = [
+                    'id'            => $row['id'],
+                    'content'       => $row['content'],
+                    'source'        => $row['source'],
+                    'meta_summary'  => $row['meta_summary'],
+                    'meta_tags'     => $row['meta_tags'],
+                    'meta_timestamp'=> $row['meta_timestamp'],
+                ];
+            }
+        } catch (\Exception $e) {
+            $this->emError("listContextDocuments Entity error: " . $e->getMessage());
+        }
+
+        return $docs;
+    }
+
+    public function listUnifiedContextDocs(string $namespace): array {
+        $dense = $this->listPineconeNamespace($namespace, $this->getSystemSetting('pinecone_host'));
+        $sparse = $this->listPineconeNamespace($namespace, $this->getSystemSetting('pinecone_host_sparse'));
+
+        $map = [];
+
+        foreach ($dense as $row) {
+            $map[$row['id']] = [
+                'id' => $row['id'],
+                'content' => $row['content'],
+                'source' => $row['source'],
+                'dense_only' => true
+            ];
+        }
+
+        foreach ($sparse as $row) {
+            if (!isset($map[$row['id']])) {
+                $map[$row['id']] = [
+                    'id' => $row['id'],
+                    'content' => $row['content'],
+                    'source' => $row['source'],
+                    'sparse_only' => true
+                ];
+            }
+        }
+
+        return array_values($map);
+    }
+
+    private function listPineconeNamespace(string $namespace, string $host): array {
+        // Skip ALL serverless hosts (serverless cannot use describe_index_stats)
+        if (preg_match('/\.svc\./i', $host) || preg_match('/gcp-.*\.pinecone\.io$/i', $host)) {
+            $this->emDebug("Skipping serverless host (listing unsupported): $host");
+            return [];
+        }
+
+
+        $stats = $this->pineconeRequestCustomHost($host, '/describe_index_stats', [], 'POST');
+
+        if (!isset($stats['namespaces'][$namespace])) {
+            return [];
+        }
+
+        $fakeVector = array_fill(0, 1536, 0.0);
+
+        $resp = $this->pineconeRequestCustomHost($host, '/query', [
+            'namespace' => $namespace,
+            'topK' => 5000,
+            'includeMetadata' => true,
+            'vector' => $fakeVector
+        ], 'POST');
+
+        $rows = [];
+        foreach ($resp['matches'] as $m) {
+            $meta = $m['metadata'] ?? [];
+            $rows[] = [
+                'id' => $m['id'],
+                'content' => $meta['content'] ?? '',
+                'source' => $meta['source'] ?? ''
+            ];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Fetch a single context document by id for a given project / namespace.
+     *
+     * @param string $projectIdentifier
+     * @param string $id
+     * @return array|null
+     */
+    public function fetchContextDocument(string $projectIdentifier, string $id): ?array
+    {
+        if ($this->isVectorDbEnabled()) {
+            try {
+                $namespace = $projectIdentifier;
+                $payload   = [
+                    'namespace' => $namespace,
+                    'ids'       => [$id],
+                ];
+
+                $body = $this->pineconeRequest('/vectors/fetch', $payload, 'POST');
+
+                if (!isset($body['vectors'][$id])) {
+                    return null;
+                }
+
+                $vec  = $body['vectors'][$id];
+                $meta = $vec['metadata'] ?? [];
+
+                return [
+                    'id'            => (string)$id,
+                    'content'       => $meta['content'] ?? '',
+                    'source'        => $meta['source'] ?? '',
+                    'meta_summary'  => $meta['meta_summary'] ?? null,
+                    'meta_tags'     => $meta['meta_tags'] ?? null,
+                    'meta_timestamp'=> $meta['timestamp'] ?? null,
+                ];
+            } catch (\Exception $e) {
+                $this->emError("fetchContextDocument Pinecone error: " . $e->getMessage());
+                return null;
+            }
+        }
+
+        // Entity / MySQL fallback
+        try {
+            $sql = "
+                SELECT id, content, source, meta_summary, meta_tags, meta_timestamp
+                FROM redcap_entity_generic_contextdb
+                WHERE project_identifier = ?
+                  AND id = ?
+                LIMIT 1
+            ";
+            $params = [$projectIdentifier, $id];
+
+            $result = $this->query($sql, $params);
+            if ($row = db_fetch_assoc($result)) {
+                return [
+                    'id'            => $row['id'],
+                    'content'       => $row['content'],
+                    'source'        => $row['source'],
+                    'meta_summary'  => $row['meta_summary'],
+                    'meta_tags'     => $row['meta_tags'],
+                    'meta_timestamp'=> $row['meta_timestamp'],
+                ];
+            }
+        } catch (\Exception $e) {
+            $this->emError("fetchContextDocument Entity error: " . $e->getMessage());
+        }
+
+        return null;
+    }
+
+
+    /**
+     * Delete a single context document by id.
+     *
+     * @param string $projectIdentifier
+     * @param string $id
+     * @return bool
+     */
+    public function deleteContextDocument(string $projectIdentifier, string $id): bool
+    {
+        if ($this->isVectorDbEnabled()) {
+            $namespace = $projectIdentifier;
+
+            // Payload is same for both
+            $payload = [
+                'namespace' => $namespace,
+                'ids'       => [$id],
+            ];
+
+            try {
+                // Delete from dense index
+                if ($host = $this->getSystemSetting('pinecone_host')) {
+                    $this->pineconeRequestCustomHost($host, '/vectors/delete', $payload, 'POST');
+                }
+
+                // Delete from sparse index
+                if ($hostSparse = $this->getSystemSetting('pinecone_host_sparse')) {
+                    $this->pineconeRequestCustomHost($hostSparse, '/vectors/delete', $payload, 'POST');
+                }
+
+                return true;
+
+            } catch (\Exception $e) {
+                $this->emError("deleteContextDocument Pinecone hybrid error: " . $e->getMessage());
+                return false;
+            }
+        }
+
+        // Entity / MySQL fallback
+        try {
+            $sql    = "DELETE FROM redcap_entity_generic_contextdb WHERE project_identifier = ? AND id = ?";
+            $params = [$projectIdentifier, $id];
+            $this->query($sql, $params);
+            return true;
+        } catch (\Exception $e) {
+            $this->emError("deleteContextDocument Entity error: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Purge all context documents for a given project/namespace.
+     *
+     * @param string $projectIdentifier
+     * @return bool
+     */
+    public function purgeContextNamespace(string $projectIdentifier): bool
+    {
+        if ($this->isVectorDbEnabled()) {
+            try {
+                $namespace = $projectIdentifier;
+                $payload = [
+                    'namespace' => $namespace,
+                    'deleteAll' => true,
+                ];
+
+                // Dense host
+                $denseHost = $this->getSystemSetting('pinecone_host');
+                if ($denseHost) {
+                    $this->pineconeRequestCustomHost($denseHost, '/vectors/delete', $payload, 'POST');
+                }
+
+                // Sparse host
+                $sparseHost = $this->getSystemSetting('pinecone_host_sparse');
+                if ($sparseHost) {
+                    $this->pineconeRequestCustomHost($sparseHost, '/vectors/delete', $payload, 'POST');
+                }
+
+                return true;
+            } catch (\Exception $e) {
+                $this->emError("purgeContextNamespace error: " . $e->getMessage());
+                return false;
+            }
+        }
+
+        // MySQL fallback
+        try {
+            $sql = "DELETE FROM redcap_entity_generic_contextdb 
+                    WHERE project_identifier = ?";
+            $this->query($sql, [$projectIdentifier]);
+            return true;
+        } catch (\Exception $e) {
+            $this->emError("purgeContextNamespace Entity error: " . $e->getMessage());
+            return false;
+        }
+    }
+
+
+    /**
+     * Simple debug search over context documents using the existing embedding model.
+     * This is a lighter-weight version of getRelevantDocuments for a plain text query.
+     *
+     * @param string $projectIdentifier
+     * @param string $query
+     * @param int    $topK
+     * @return array
+     */
+    public function debugSearchContext(string $projectIdentifier, string $query, int $topK = 3): array
+    {
+        $queryEmbedding = $this->getEmbedding($query);
+        if (!$queryEmbedding) {
+            return [];
+        }
+
+        $sparseQuery = $this->generateSparseVector($query);
+
+        // If vector DB is enabled, reuse Pinecone query
+        if ($this->isVectorDbEnabled()) {
+            try {
+                $namespace = $projectIdentifier;
+
+                // --- Dense search ---
+                $denseResults = [];
+                try {
+                    $denseResults = $this->pineconeQuery($namespace, $queryEmbedding, $topK);
+                } catch (\Exception $e) {
+                    $this->emError("debug dense query failed: ".$e->getMessage());
+                }
+
+                // --- Sparse search ---
+                $sparseResults = [];
+                try {
+                    $sparseResults = $this->pineconeSparseQuery($namespace, $sparseQuery, $topK);
+                } catch (\Exception $e) {
+                    $this->emError("debug sparse query failed: ".$e->getMessage());
+                }
+
+
+                $this->emDebug("denseResults", $denseResults);
+                $this->emDebug("sparseResults", $sparseResults);
+                // --- Merge ---
+                $merged = $this->mergeHybridResults($denseResults, $sparseResults, $topK);
+
+                $documents = [];
+                foreach ($merged as $m) {
+                    $meta = $m['metadata'] ?? [];
+                    $documents[] = [
+                        'id'            => $m['id'] ?? null,
+                        'content'       => $meta['content'] ?? '',
+                        'source'        => $meta['source'] ?? '',
+                        'meta_summary'  => $meta['meta_summary'] ?? null,
+                        'meta_tags'     => $meta['meta_tags'] ?? null,
+                        'meta_timestamp'=> $meta['timestamp'] ?? null,
+                        'dense'         => $m['dense_score']  ?? null,
+                        'sparse'        => $m['sparse_score'] ?? null,
+                        'similarity'    => $m['hybrid_score'] ?? 0,
+                    ];
+                }
+
+                return $documents;
+
+            } catch (\Exception $e) {
+                $this->emError("debugSearchContext Pinecone error: ".$e->getMessage());
+                return [];
+            }
+        }
+
+
+        // Entity / MySQL fallback: cosine similarity over all rows
+        $documents = [];
+        try {
+            $sql = "
+                SELECT id
+                FROM redcap_entity_generic_contextdb
+                WHERE project_identifier = ?
+            ";
+            $params = [$projectIdentifier];
+            $result = $this->query($sql, $params);
+
+            $entityFactory = $this->getEntityFactory();
+            while ($row = db_fetch_assoc($result)) {
+                $entity       = $entityFactory->getInstance('generic_contextdb', $row['id']);
+                $data         = $entity->getData();
+                $docEmbedding = json_decode($data['vector_embedding'], true);
+
+                if (!is_array($docEmbedding)) {
+                    continue;
+                }
+
+                $similarity = $this->cosineSimilarity($queryEmbedding, $docEmbedding);
+
+                $documents[] = [
+                    'id'            => $entity->getId(),
+                    'content'       => $data['content'],
+                    'source'        => $data['source'],
+                    'meta_summary'  => $data['meta_summary'],
+                    'meta_tags'     => $data['meta_tags'],
+                    'meta_timestamp'=> $data['meta_timestamp'],
+                    'similarity'    => $similarity,
+                ];
+            }
+        } catch (\Exception $e) {
+            $this->emError("debugSearchContext Entity error: " . $e->getMessage());
+            return [];
+        }
+
+        usort($documents, function ($a, $b) {
+            return $b['similarity'] <=> $a['similarity'];
+        });
+
+        return array_slice($documents, 0, $topK);
+    }
+
+
+
 
     /**
      * Get the SecureChatAI instance from the module.

@@ -1,203 +1,185 @@
-# REDCapRAG External Module
+# REDCap RAG External Module (RedcapRAG)
 
-**REDCapRAG** is a modular External Module for REDCap that enables **Retrieval-Augmented Generation (RAG)** workflows in any REDCap project. It allows you to store, index, and semantically search knowledge base documents using vector embeddings—powering smarter AI assistants, chatbots, and search tools in REDCap.
-
----
-
-## Key Features
-
-- **Pluggable Context Store:**  
-  Store arbitrary documents, summaries, or notes and retrieve them by semantic similarity (not just keyword match).
-
-- **Project-Based Collections:**  
-  Each project (or logical scope) has its own vector index for privacy and relevance.
-
-- **Flexible Backends:**  
-  - **Redis** (with Redis Search module): for fast, production-scale search  
-  - **REDCap Entity Table:** fallback for smaller projects or environments without Redis
-
-- **Embeddings Powered by SecureChatAI EM:**  
-  Embeddings are generated using the SecureChatAI EM, which can use any supported model (e.g., OpenAI Ada, GPT, DeepSeek, etc.).
-
-- **Cosine Similarity Search:**  
-  Document retrieval is based on vector math—finds the most semantically relevant context.
-
-- **Developer-Friendly Public API:**  
-  Expose `storeDocument`, `getRelevantDocuments`, etc. so *any* other EM or workflow can use RAG.
+This module provides a hybrid RAG (Retrieval-Augmented Generation) layer for REDCap projects. It allows you to ingest text, PDF-derived chunks, or custom context data and retrieve them using **dense semantic vectors**, **sparse keyword vectors**, or a **hybrid of both** using Pinecone.
 
 ---
 
-## Why This Module?
+## Features
 
-- **Separation of Concerns:**  
-  - RAG manages context storage & search only.  
-  - SecureChatAI handles embedding generation and LLM API calls.  
-  - Chatbots (or any AI workflows) can consume RAG without pulling in chat-specific code.
-- **Composable:**  
-  Use RAG for chatbots, form assistance, research search, or any AI augmentation.
+### **1. Hybrid Vector Search (Dense + Sparse)**
 
----
+* Dense semantic search via embeddings
+* Sparse keyword search via TF-based hashing
+* Automated hybrid scoring with configurable weights
+* Post-merge top‑K selection for accuracy
 
-## Typical Workflow
+### **2. Two Storage Modes**
 
-```php
-// Get the RAG EM instance via your main EM’s baseclass helper
-$rag = $module->getRedcapRAGInstance(); // or $this->getRedcapRAGInstance() in a class
+* **Vector DB mode (Pinecone)** – full hybrid retrieval
+* **MySQL Entity mode** – fallback when Pinecone is disabled
 
-// Store a document for later retrieval
-$rag->storeDocument($projectIdentifier, $title, $content);
+### **3. RAG Namespace Isolation**
 
-// Retrieve relevant documents for a user query
-$results = $rag->getRelevantDocuments($projectIdentifier, $chatArray, 5);
-```
+Each REDCap project can define its own:
 
----
+* `project_rag_project_identifier`
 
-## Plug RAG into any Chatbot/AI EM
+This value becomes the Pinecone namespace or MySQL partition.
 
-Example: Use RAG to fetch context for each user question in your chatbot, and inject into the LLM prompt.
+### **4. Deduplication**
 
----
+Documents use a stable SHA‑256 hash to avoid re‑inserting duplicates.
 
-## Public Functions (for other EMs)
+### **5. Admin Debug Panel**
 
-- `storeDocument($projectIdentifier, $title, $content, $dateCreated = null)`  
-  Store a new document (auto-embeds and dedupes).
+Allows you to:
 
-- `getRelevantDocuments($projectIdentifier, $queryArray, $limit = 3)`  
-  Retrieve up to `$limit` most relevant docs for a query (pass in user message array).
+* Search vectors
+* Inspect dense/sparse scores
+* Delete individual vectors
+* Purge entire namespaces
+* View and manage stored documents
 
-- `checkAndStoreDocument($projectIdentifier, $title, $content, $dateCreated = null)`  
-  Convenience function: only stores if unique.
+### **6. Zero‑Vector Namespace Listing**
 
----
-
-## Data Model (Entity Table backend)
-
-- `project_identifier`: Project or logical scope for grouping.
-- `content`, `content_type`, `file_url`
-- `vector_embedding`: JSON-encoded vector from SecureChatAI
-- `source`, `meta_summary`, `meta_tags`, `meta_timestamp`
-- `hash`: SHA256 for deduplication
-- `upvotes`, `downvotes`: For user feedback (future relevance tuning)
-
----
-
-## Backend Selection
-
-**Redis (Recommended):**
-- Fast, scalable, required for large or production setups.
-- Needs Redis Search module enabled.
-
-**Entity Table:**
-- Built-in, slower, best for small or demo sites.
+Serverless Pinecone hosts are auto-detected and skipped since they do not support listing.
 
 ---
 
 ## Installation
 
-1. **Install SecureChatAI EM** and configure LLM/embedding endpoints.
-2. **Install Redis** (optional, for high performance).
-3. **Add REDCapRAG EM to your REDCap modules directory.**
-4. **Enable the module** in the REDCap External Modules admin UI.
-5. **Configure your backend** (choose Redis or fallback to Entity Table).
-6. **Build entity schema** (auto-runs when enabled).
+1. Place the module directory inside:
 
----
-
-## Running Redis (with Redis Search) Locally for REDCapRAG
-
-REDCapRAG supports a high-performance Redis backend out of the box.
-For development, you can spin up a Redis + Redis Search server (with browser UI!) in seconds using Docker Compose.
-
-### Quick Start: Docker Compose
-
-Add this to your `docker-compose.yml` or run it standalone:
-
-```yaml
-services:
-  redis:
-    image: redis/redis-stack:latest
-    container_name: redis-stack
-    ports:
-      - "6379:6379"    # Redis server port
-      - "8001:8001"    # RedisInsight UI (browser dashboard)
-    environment:
-      - REDIS_ARGS=--save 60 1 --loglevel warning
-    volumes:
-      - redis_data:/data
-
-volumes:
-  redis_data:
+```
+/redcap/modules/redcap_rag_vX.X.X/
 ```
 
-This runs Redis Stack with RedisSearch enabled and persistent data.
+2. Enable the module in **Control Center → External Modules**.
 
-Browse to http://localhost:8001 for the RedisInsight UI (explore keys, see embeddings, debug!)
+3. Configure required settings:
 
----
+### **Required (Vector DB mode)**
 
-### Configuring REDCapRAG to Use Your Local Redis
+* Pinecone API Key
+* Pinecone Dense Host (serverless)
+* Pinecone Sparse Host (pod index)
+* Enable: `use_vectordb`
 
-**Redis Server Address:**
+### **Required (Both modes)**
 
-- If REDCap’s webserver is running on the host, use: `localhost`
-- If REDCap is in Docker and Redis is running on the host or another container, use: `host.docker.internal`
-    - *Note: `host.docker.internal` lets a Docker container access services on the host machine. It works on Mac/Windows and recent Linux with Docker Desktop.*
-
-**Redis Port:**  
-`6379`
+* `project_rag_project_identifier`
 
 ---
 
-## FAQ / Gotchas
+## Key Concepts
 
-- **How does a chatbot (e.g., Cappy) use RAG?**  
-  It calls `getRelevantDocuments()` each time it needs context for an LLM call.
+### **Dense Embeddings (Semantic)**
 
-- **How are embeddings generated?**  
-  RAG calls SecureChatAI EM to generate them—so you can swap embedding providers by updating SecureChatAI.
+Generated through SecureChatAI using model `ada-002`.
 
-- **What about relevance tuning?**  
-  Upvote/downvote fields are included for future expansion—user feedback loops, etc.
+### **Sparse Vectors (Keywords)**
 
-- You can run Redis inside or outside your REDCap Docker stack.  
-  Just make sure ports are open, and point REDCapRAG at the right address (`host.docker.internal` for container-to-host).
+Lightweight TF hash-based:
 
-- Check RedisInsight for live data.  
-  If you see keys like `vector_contextdb:YOUR_PROJECT_ID`, ingestion is working!
+* tokenizes text
+* computes normalized term frequency
+* assigns stable indices via `crc32(term) % 200000`
 
----
+### **Hybrid Merging**
 
-## Required PHP Extensions / Dockerfile Changes
+Scores are normalized and combined:
 
-If you are running REDCap in Docker (recommended for most modern deployments), you need to ensure the `php-redis` extension is installed in your REDCap web container. This is required for REDCapRAG to use Redis.
+```
+hybrid = (dense_weight * denseScore) + (sparse_weight * sparseScore)
+```
 
-**Update your Dockerfile** (or your docker-compose web build section) to include:
-
-```Dockerfile
-RUN pecl install redis \
-    && docker-php-ext-enable redis
-```    
-
-Rebuild and restart your REDCap web container after making this change.
-
-**Why?**
-
-- Without this, you'll get PHP errors like `Class 'Redis' not found` when the module tries to use Redis as a backend.
-- This step is required for any PHP code that needs Redis access.
-
-
-## Developer Notes
-
-- Cosine similarity math is native PHP for Entity Table; for Redis, you can implement server-side scoring.
-- Batch processing and backend abstraction are ready for future scaling.
-- Public API is stable: Use from any EM, service, or custom workflow.
+Top‑K is applied *after* merging.
 
 ---
 
-## See Also
+## 📘 Public Methods
 
-- [SecureChatAI External Module](https://github.com/susom/secureChatAI) (embedding and LLM orchestration)
-- [REDCap Chatbot](https://github.com/susom/redcap-em-chatbot)
+### `storeDocument($projectId, $title, $content, $dateCreated)`
 
+Stores a document with embedding and sparse vector.
+
+### `checkAndStoreDocument(...)`
+
+Deduplicates by SHA‑256 and only stores if missing.
+
+### `getRelevantDocuments($projectId, $messages, $topK)`
+
+Retrieves RAG context for SecureChatAI calls.
+
+### `debugSearchContext($projectId, $query, $topK)`
+
+Used by the admin panel debug tool.
+
+### `listContextDocuments($projectId)`
+
+List all documents belonging to a namespace.
+
+### `deleteContextDocument($projectId, $id)`
+
+Delete a single document.
+
+### `purgeContextNamespace($projectId)`
+
+Delete *all* vectors for a namespace.
+
+---
+
+## 🛠 Internal Mechanics
+
+### Embeddings
+
+Uses SecureChatAI → OpenAI embeddings via:
+
+```
+callAI("ada-002", ["input" => $text])
+```
+
+### Sparse Upserts
+
+Sent to Pinecone pod index for keyword augmentation.
+
+### Hybrid Merge
+
+1. Collect all unique IDs
+2. Normalize sparse (log scale)
+3. Weighted combine
+4. Sort
+5. Slice to top‑K
+
+---
+
+## Security Notes
+
+* All admin actions require REDCap user permissions
+* CSRF tokens included in all write operations
+* No PHI is stored unless sources include it explicitly
+
+---
+
+## License
+
+Internal Stanford Research IT use unless otherwise specified.
+
+---
+
+If you’d like, I can also generate:
+
+* A **Bootstrap-styled Debug UI** README screenshots section
+* An "Advanced Setup" section for multi-agent pipelines
+* A "Troubleshooting" section (Pinecone issues, namespace confusion, etc.)
+
+## MySQL Fallback Path
+
+If Pinecone is disabled or unavailable, the module automatically falls back to REDCap Entity storage (`redcap_entity_generic_contextdb`).
+
+* Computes cosine similarity over stored JSON embeddings
+* No additional configuration required
+* Ideal for dev/local or restricted environments
+* Recommended for small corpora (<5k docs)
+
+When fallback activates, logs show: `debugSearchContext Entity fallback`.
