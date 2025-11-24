@@ -600,6 +600,26 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
             $values[]  = $weight;
         }
 
+        // After building $indices[] and $values[]
+        $combined = [];
+        for ($i = 0; $i < count($indices); $i++) {
+            $idx = $indices[$i];
+            $val = $values[$i];
+            if (!isset($combined[$idx])) {
+                $combined[$idx] = $val;
+            } else {
+                $combined[$idx] += $val;   // combine TF weights on collision
+            }
+        }
+
+        // Now rewrite indices + values clean
+        $indices = array_keys($combined);
+        $values  = array_values($combined);
+
+        // Sort (required by Pinecone)
+        array_multisort($indices, SORT_ASC, $values);
+
+
         return [
             'indices' => $indices,
             'values' => $values
