@@ -571,7 +571,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     }
 
     private function generateSparseVector(string $text): array {
-        // Basic tokenizer
+        // Tokenize
         $words = preg_split('/\W+/u', strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
         if (empty($words)) {
             return ['indices' => [], 'values' => []];
@@ -580,51 +580,45 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         // Term frequency map
         $freq = [];
         foreach ($words as $w) {
-            if (!isset($freq[$w])) $freq[$w] = 0;
-            $freq[$w]++;
+            $freq[$w] = ($freq[$w] ?? 0) + 1;
         }
 
         // Normalize weights
         $maxFreq = max($freq);
+
         $indices = [];
-        $values = [];
+        $values  = [];
 
         foreach ($freq as $term => $count) {
             $weight = $count / $maxFreq;
 
-            // Convert term → stable “sparse index”
-            // Use crc32 mod large prime (Pinecone recommends <= 2^32)
-            $idx = crc32($term) % 200000; // keep it small-ish for now
+            // hash → stable sparse index
+            $idx = crc32($term) % 200000;
 
             $indices[] = $idx;
             $values[]  = $weight;
         }
 
-        // After building $indices[] and $values[]
+        // Deduplicate collisions
         $combined = [];
-        for ($i = 0; $i < count($indices); $i++) {
-            $idx = $indices[$i];
+        foreach ($indices as $i => $idx) {
             $val = $values[$i];
-            if (!isset($combined[$idx])) {
-                $combined[$idx] = $val;
-            } else {
-                $combined[$idx] += $val;   // combine TF weights on collision
-            }
+            $combined[$idx] = ($combined[$idx] ?? 0) + $val;
         }
 
-        // Now rewrite indices + values clean
+        // Rebuild arrays
         $indices = array_keys($combined);
         $values  = array_values($combined);
 
         // Sort (required by Pinecone)
-        array_multisort($indices, SORT_ASC, $values);
-
+        array_multisort($indices, SORT_ASC, SORT_NUMERIC, $values);
 
         return [
             'indices' => $indices,
-            'values' => $values
+            'values'  => $values
         ];
     }
+
 
     private function pineconeSparseUpsert($namespace, $vectors) {
         $apiKey = $this->getSystemSetting('pinecone_api_key');
