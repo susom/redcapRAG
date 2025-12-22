@@ -5,7 +5,7 @@ require_once "emLoggerTrait.php";
 
 $entityBase = dirname(__DIR__, 1) . '/redcap_entity_v9.9.9/classes/';
 require_once $entityBase . 'Page.php';
-require_once $entityBase . 'EntityFormTrait.php';   
+require_once $entityBase . 'EntityFormTrait.php';
 require_once $entityBase . 'Entity.php';
 require_once $entityBase . 'EntityFactory.php';
 require_once $entityBase . 'EntityDB.php';
@@ -121,7 +121,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
     private function getEntityFactory() {
         if (!$this->entityFactory) {
-            $this->entityFactory = new \REDCapEntity\EntityFactory($this->PREFIX); 
+            $this->entityFactory = new \REDCapEntity\EntityFactory($this->PREFIX);
         }
         return $this->entityFactory;
     }
@@ -152,7 +152,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
 
     /**
-     * 
+     *
      */
     private function getEmbedding($text) {
         try {
@@ -298,7 +298,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         // Sparse map (id => score)
         $sparseMap = [];
         foreach (($sparse['matches'] ?? []) as $m) {
-            $sparseNorm = log(1 + $m['score']);  
+            $sparseNorm = log(1 + $m['score']);
             $sparseMap[$m['id']] = $sparseNorm;
         }
         $this->emDebug("Sparse map", $sparseMap);
@@ -732,7 +732,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
      * @return array
      * @throws \Exception
      */
-    private function pineconeRequest(string $path, array $payload, string $method = 'POST'): array
+    private function pineconeRequest(string $path, array $payload, string $method = 'POST', string $apiVersion = '2025-04'): array
     {
         $apiKey = $this->getSystemSetting('pinecone_api_key');
         $host   = rtrim((string)$this->getSystemSetting('pinecone_host'), '/');
@@ -748,9 +748,13 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
             'headers' => [
                 'Api-Key'      => $apiKey,
                 'Content-Type' => 'application/json',
+                'X-Pinecone-Api-Version' => $apiVersion,
             ],
-            'json'    => $payload,
         ];
+
+        if (!empty($payload)) {
+            $options['json'] = $payload;
+        }
 
         $response = $client->request($method, $url, $options);
         $body     = (string)$response->getBody();
@@ -853,6 +857,20 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         }
 
         return $docs;
+    }
+
+    public function getPineconeNamespaces(){
+        if ($this->isVectorDbEnabled()) {
+            try {
+                $namespaces = $this->pineconeRequest('/namespaces', [], 'GET');
+                if(!empty($namespaces) && array_key_exists('namespaces', $namespaces)){
+                    return $namespaces['namespaces'];
+                }
+            } catch (\Exception $e) {
+                $this->emError("Error called attempting to fetch namespaces from Pinecone");
+            }
+        }
+        return [];
     }
 
     public function listUnifiedContextDocs(string $namespace): array {
@@ -1076,7 +1094,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
         // MySQL fallback
         try {
-            $sql = "DELETE FROM redcap_entity_generic_contextdb 
+            $sql = "DELETE FROM redcap_entity_generic_contextdb
                     WHERE project_identifier = ?";
             $this->query($sql, [$projectIdentifier]);
             return true;

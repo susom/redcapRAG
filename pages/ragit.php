@@ -7,8 +7,8 @@ if (!SUPER_USER && !USERID) {
 }
 
 // Selected namespace / project identifier
-$projectIdentifier = trim($_POST['project_identifier'] ?? ($_GET['project_identifier'] ?? ''));
-
+$projectIdentifier = trim($_POST['project_identifier'] ?? '');
+$namespaces = $module->getPineconeNamespaces();
 $action  = $_POST['action'] ?? null;
 $results = null;
 $rows    = [];
@@ -125,41 +125,101 @@ function ragHeatStyle($score): string
     <h2 class="mb-3">REDCap RAG Debug Panel</h2>
 
     <!-- Namespace selector -->
-    <div class="card mb-4">
-        <div class="card-body">
-            <form class="row g-3" method="post">
-                <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
-                <div class="col-md-6 col-lg-4">
-                    <label for="project_identifier" class="form-label">
-                        Namespace / Project Identifier
-                    </label>
-                    <input
-                        type="text"
-                        class="form-control"
-                        id="project_identifier"
-                        name="project_identifier"
-                        value="<?= htmlspecialchars($projectIdentifier) ?>"
-                        placeholder="e.g. rexi_contextdb"
-                    >
-                </div>
-                <div class="col-md-3 align-self-end">
-                    <button type="submit" class="btn btn-primary">
-                        Load Namespace
-                    </button>
-                </div>
-            </form>
+    <div class="row mb-4">
+        <!-- LEFT: Namespace selector -->
+        <div class="col-md-6">
+            <div class="card mb-4 h-100">
+                <div class="card-body">
+                    <form class="row g-3" method="post">
+                        <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
 
-            <?php if ($projectIdentifier !== ''): ?>
-                <div class="mt-2">
-                    <span class="badge bg-secondary badge-namespace">
-                        Current namespace: <?= htmlspecialchars($projectIdentifier) ?>
-                    </span>
+                        <div class="col-md-6 col-lg-8">
+                            <label for="project_identifier" class="form-label">
+                                Namespace / Project Identifier
+                            </label>
+
+                            <select
+                                class="form-select"
+                                id="project_identifier"
+                                name="project_identifier"
+                            >
+                                <option value="">Select a namespace…</option>
+
+                                <?php foreach ($namespaces as $namespace): ?>
+                                    <option
+                                        value="<?= htmlspecialchars($namespace['name']) ?>"
+                                        <?= $namespace['name'] === $projectIdentifier ? 'selected' : '' ?>
+                                    >
+                                        <?= htmlspecialchars($namespace['name']) ?>
+                                        (<?= (int) $namespace['record_count'] ?> records)
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="col-md-4 align-self-end">
+                            <button type="submit" class="btn btn-primary">
+                                Load Namespace
+                            </button>
+                        </div>
+                    </form>
+
+                    <?php if ($projectIdentifier !== ''): ?>
+                        <div class="mt-3">
+                        <span class="badge bg-secondary badge-namespace">
+                            Current namespace: <?= htmlspecialchars($projectIdentifier) ?>
+                        </span>
+                        </div>
+                    <?php else: ?>
+                        <div class="mt-3 text-muted">
+                            Enter a namespace to view stored documents and run test searches.
+                        </div>
+                    <?php endif; ?>
                 </div>
-            <?php else: ?>
-                <div class="mt-2 text-muted">
-                    Enter a namespace to view stored documents and run test searches.
+            </div>
+        </div>
+
+        <!-- RIGHT: Purge namespace -->
+        <div class="col-md-6">
+            <div class="card mb-4 border-danger h-100">
+                <div class="card-header bg-danger text-white">
+                    Purge Namespace
                 </div>
-            <?php endif; ?>
+                <div class="card-body">
+                    <p class="mb-2">
+                        This will permanently delete all context vectors for
+                        <strong><?= htmlspecialchars($projectIdentifier) ?></strong>.
+                    </p>
+                    <p class="small text-muted">
+                        Type the namespace exactly to confirm.
+                    </p>
+
+                    <form class="row g-3" method="post">
+                        <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
+                        <input type="hidden" name="action" value="purge">
+                        <input type="hidden" name="project_identifier" value="<?= htmlspecialchars($projectIdentifier) ?>">
+
+                        <div class="col-md-7">
+                            <input
+                                type="text"
+                                class="form-control"
+                                name="confirm"
+                                placeholder="<?= htmlspecialchars($projectIdentifier) ?>"
+                            >
+                        </div>
+
+                        <div class="col-md-5">
+                            <button
+                                type="submit"
+                                class="btn btn-outline-danger w-100"
+                                onclick="return confirm('Delete all vectors for this namespace?');"
+                            >
+                                Purge All
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -349,50 +409,50 @@ function ragHeatStyle($score): string
         </div>
 
         <!-- Purge namespace card -->
-        <div class="card mb-4 border-danger">
-            <div class="card-header bg-danger text-white">
-                Purge Namespace
-            </div>
-            <div class="card-body">
-                <p class="mb-2">
-                    This will permanently delete all context vectors for
-                    <strong><?= htmlspecialchars($projectIdentifier) ?></strong>.
-                </p>
-                <p class="small text-muted">
-                    Type the namespace exactly to confirm.
-                </p>
-                <form class="row g-3" method="post">
-                    <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
-                    <input type="hidden" name="action" value="purge">
-                    <input type="hidden" name="project_identifier" value="<?= htmlspecialchars($projectIdentifier) ?>">
-
-                    <div class="col-md-4 col-lg-3">
-                        <input
-                            type="text"
-                            class="form-control"
-                            name="confirm"
-                            placeholder="<?= htmlspecialchars($projectIdentifier) ?>"
-                        >
-                    </div>
-                    <div class="col-md-3">
-                        <button
-                            type="submit"
-                            class="btn btn-outline-danger"
-                            onclick="return confirm('Delete all vectors for this namespace?');"
-                        >
-                            Purge All
-                        </button>
-                    </div>
-                </form>
-            </div>
-        </div>
+<!--        <div class="card mb-4 border-danger">-->
+<!--            <div class="card-header bg-danger text-white">-->
+<!--                Purge Namespace-->
+<!--            </div>-->
+<!--            <div class="card-body">-->
+<!--                <p class="mb-2">-->
+<!--                    This will permanently delete all context vectors for-->
+<!--                    <strong>--><?php //= htmlspecialchars($projectIdentifier) ?><!--</strong>.-->
+<!--                </p>-->
+<!--                <p class="small text-muted">-->
+<!--                    Type the namespace exactly to confirm.-->
+<!--                </p>-->
+<!--                <form class="row g-3" method="post">-->
+<!--                    <input type="hidden" name="redcap_csrf_token" value="--><?php //= $module->getCSRFToken() ?><!--">-->
+<!--                    <input type="hidden" name="action" value="purge">-->
+<!--                    <input type="hidden" name="project_identifier" value="--><?php //= htmlspecialchars($projectIdentifier) ?><!--">-->
+<!---->
+<!--                    <div class="col-md-4 col-lg-3">-->
+<!--                        <input-->
+<!--                            type="text"-->
+<!--                            class="form-control"-->
+<!--                            name="confirm"-->
+<!--                            placeholder="--><?php //= htmlspecialchars($projectIdentifier) ?><!--"-->
+<!--                        >-->
+<!--                    </div>-->
+<!--                    <div class="col-md-3">-->
+<!--                        <button-->
+<!--                            type="submit"-->
+<!--                            class="btn btn-outline-danger"-->
+<!--                            onclick="return confirm('Delete all vectors for this namespace?');"-->
+<!--                        >-->
+<!--                            Purge All-->
+<!--                        </button>-->
+<!--                    </div>-->
+<!--                </form>-->
+<!--            </div>-->
+<!--        </div>-->
 
         <!-- Stored documents list -->
-        <div class="card">
+        <div class="card h-100 d-flex flex-column" style="height: calc(100vh - 500px) !important;">
             <div class="card-header">
                 Stored Documents (<?= count($rows) ?>)
             </div>
-            <div class="card-body">
+            <div class="card-body overflow-auto">
                 <?php if (count($rows)): ?>
                     <div class="table-responsive">
                         <table
