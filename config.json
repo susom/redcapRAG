@@ -70,54 +70,82 @@
         },
         {
             "key": "use_vectordb",
-            "name": "Use Vector Database (Pinecone) for RAG",
+            "name": "<b>Use Vector Database (Pinecone) for RAG</b>",
             "required": false,
             "type": "checkbox"
         },
         {
             "key": "pinecone_inference_host",
-            "name": "Pinecone Inference/Embeddings API Endpoint <br><i>Required if Vector DB is enabled</i>",
+            "name": "<b>Pinecone Inference/Embeddings API Endpoint</b><br><i>Required if Vector DB is enabled</i>",
             "required": false,
-            "type": "text"
+            "type": "text",
+            "branchingLogic": {
+                "field": "use_vectordb",
+                "value": "1"
+            }
         },
         {
             "key": "pinecone_host",
-            "name": "Pinecone Host (Dense) Endpoint <br><i>Required if Vector DB is enabled</i>",
+            "name": "<b>Pinecone Host (Dense) Endpoint </b><br><i>Required if Vector DB is enabled</i>",
             "required": false,
-            "type": "text"
+            "type": "text",
+            "branchingLogic": {
+                "field": "use_vectordb",
+                "value": "1"
+            }
         },
         {
             "key": "pinecone_host_sparse",
-            "name": "Pinecone Host (Sparse) Endpoint <br><i>Required if Vector DB is enabled</i>",
+            "name": "<b>Pinecone Host (Sparse) Endpoint </b><br><i>Required if Vector DB is enabled</i>",
             "required": false,
-            "type": "text"
+            "type": "text",
+            "branchingLogic": {
+                "field": "use_vectordb",
+                "value": "1"
+            }
         },
         {
             "key": "hybrid_candidate_k",
-            "name": "Hybrid Search: Retrieval K <br><i>Number of dense+sparse candidates before hybrid merge</i>",
+            "name": "<b>Hybrid Search: Retrieval K </b><br><i>Number of dense+sparse candidates before hybrid merge</i>",
             "type": "text",
             "required": false,
-            "default": "20"
+            "default": "20",
+            "branchingLogic": {
+                "field": "use_vectordb",
+                "value": "1"
+            }
         },
         {
             "key": "hybrid_dense_weight",
-            "name": "Hybrid Search: Dense Weight (0–1)",
+            "name": "<b>Hybrid Search: Dense Weight (0–1)</b><br><i>Scaling factor that determines the contribution of dense embedding similarity within the hybrid search score. Increasing this value favors semantic relevance over exact keyword matches.</i>",
             "type": "text",
             "required": false,
-            "default": "0.6"
-            },
+            "default": "0.6",
+            "branchingLogic": {
+                "field": "use_vectordb",
+                "value": "1"
+            }
+        },
         {
             "key": "hybrid_sparse_weight",
-            "name": "Hybrid Search: Sparse Weight (0–1)",
+            "name": "<b>Hybrid Search: Sparse Weight (0–1)</b><br><i>Adjusts the impact of keyword and exact-term matching in the hybrid search. Higher values prioritize precise lexical matches, while lower values emphasize semantic similarity.</i>",
             "type": "text",
             "required": false,
-            "default": "0.4"
+            "default": "0.4",
+            "branchingLogic": {
+                "field": "use_vectordb",
+                "value": "1"
+            }
         },
         {
             "key": "pinecone_api_key",
-            "name": "Pinecone API Key <br><i>Required if Vector DB is enabled</i>",
+            "name": "<b>Pinecone API Key </b><br><i>Required if Vector DB is enabled</i>",
             "required": false,
-            "type": "text"
+            "type": "text",
+            "branchingLogic": {
+                "field": "use_vectordb",
+                "value": "1"
+            }
         }
     ],
 
