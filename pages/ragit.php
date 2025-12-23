@@ -39,7 +39,7 @@ if ($projectIdentifier !== '') {
 
         // Search
         if ($action === 'search' && !empty($_POST['query'])) {
-            $topK = isset($_POST['top_k']) ? max(1, (int)$_POST['top_k']) : 5;
+            $topK = isset($_POST['top_k']) ? max(1, (int)$_POST['top_k']) : 20;
             $results = $module->debugSearchContext($projectIdentifier, $_POST['query'], $topK);
         }
     }
@@ -230,12 +230,12 @@ function ragHeatStyle($score): string
     <?php if ($projectIdentifier !== ''): ?>
 
         <!-- Search card -->
-        <div class="card mb-4">
+        <div  class="card mb-4">
             <div class="card-header">
                 Vector Search Test
             </div>
             <div class="card-body">
-                <form class="row g-3" method="post">
+                <form id="searchForm" class="row g-3" method="post">
                     <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
                     <input type="hidden" name="action" value="search">
                     <input type="hidden" name="project_identifier" value="<?= htmlspecialchars($projectIdentifier) ?>">
@@ -253,7 +253,12 @@ function ragHeatStyle($score): string
                     </div>
 
                     <div class="col-md-2 col-lg-1">
-                        <label class="form-label" for="top_k">Top K</label>
+                        <label class="form-label" for="top_k"
+                               data-bs-toggle="tooltip"
+                               data-bs-html="true"
+                               title="Top K: The number of highest scoring results to return from the hybrid search.">
+                            Top K
+                        </label>
                         <input
                             type="number"
                             class="form-control"
@@ -266,15 +271,16 @@ function ragHeatStyle($score): string
                     </div>
 
                     <div class="col-md-3 col-lg-3 d-flex align-items-end">
-                        <button type="submit" class="btn btn-success">
-                            Run Search
+                        <button type="submit" class="btn btn-success" id="runSearchBtn">
+                            <span id="btnText">Run Search</span>
+                            <span id="btnSpinner" class="spinner-border spinner-border-sm ms-2 d-none" role="status" aria-hidden="true"></span>
                         </button>
                     </div>
                 </form>
 
                 <?php if (is_array($results)): ?>
                     <hr>
-                    <h5 class="mb-3">
+                    <h5 class="mb-3" >
                         Search Results
                         <?php if (!empty($_POST['query'])): ?>
                             <small class="text-muted">
@@ -284,7 +290,7 @@ function ragHeatStyle($score): string
                     </h5>
 
                     <?php if (count($results)): ?>
-                        <div class="table-responsive">
+                        <div class="table-responsive" style="max-height: calc(100vh - 600px); overflow-y: auto;">
                             <table
                                 id="searchResultsTable"
                                 class="table table-sm table-hover align-middle"
@@ -293,9 +299,53 @@ function ragHeatStyle($score): string
                                 <thead class="table-light">
                                 <tr>
                                     <th scope="col" class="sortable" data-sort-key="id">ID</th>
-                                    <th scope="col" class="sortable text-end" data-sort-key="dense">Dense</th>
-                                    <th scope="col" class="sortable text-end" data-sort-key="sparse">Sparse</th>
-                                    <th scope="col" class="sortable text-end" data-sort-key="similarity">Hybrid</th>
+                                    <th
+                                        scope="col"
+                                        class="sortable text-end"
+                                        data-sort-key="dense"
+                                        data-bs-toggle="tooltip"
+                                        data-bs-placement="top"
+                                        data-bs-html="true"
+                                        title="
+        <strong>Dense Score</strong><br>
+        Measures semantic similarity using vector embeddings.<br>
+        <em>Scale:</em> 0.0 – 1.0 (higher = more similar)
+    "
+                                    >
+                                        Dense
+                                    </th>
+
+                                    <th
+                                        scope="col"
+                                        class="sortable text-end"
+                                        data-sort-key="sparse"
+                                        data-bs-toggle="tooltip"
+                                        data-bs-placement="top"
+                                        data-bs-html="true"
+                                        title="
+        <strong>Sparse Score</strong><br>
+        Measures keyword overlap using term-based search (e.g. BM25).<br>
+        <em>Scale:</em> ≥ 0 (higher = more keyword matches)
+    "
+                                    >
+                                        Sparse
+                                    </th>
+
+                                    <th
+                                        scope="col"
+                                        class="sortable text-end"
+                                        data-sort-key="similarity"
+                                        data-bs-toggle="tooltip"
+                                        data-bs-placement="top"
+                                        data-bs-html="true"
+                                        title="
+        <strong>Hybrid Score</strong><br>
+        Combined relevance score from dense + sparse search.<br>
+        <em>Scale:</em> normalized (higher = more relevant), Current weights are 0.6 dense + 0.4 sparse
+    "
+                                    >
+                                        Hybrid
+                                    </th>
                                     <th scope="col">Content snippet</th>
                                     <th scope="col" style="width: 1%;"></th>
                                 </tr>
@@ -448,7 +498,7 @@ function ragHeatStyle($score): string
 <!--        </div>-->
 
         <!-- Stored documents list -->
-        <div class="card h-100 d-flex flex-column" style="height: calc(100vh - 500px) !important;">
+        <div class="card h-100 d-flex flex-column" style="height: calc(100vh - 600px) !important;">
             <div class="card-header">
                 Stored Documents (<?= count($rows) ?>)
             </div>
@@ -576,6 +626,33 @@ function ragHeatStyle($score): string
     integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
     crossorigin="anonymous"
 ></script>
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        const tooltipTriggerList = [].slice.call(
+            document.querySelectorAll('[data-bs-toggle="tooltip"]')
+        );
+
+        tooltipTriggerList.forEach(el => {
+            new bootstrap.Tooltip(el);
+        });
+
+        const form = document.getElementById('searchForm');
+        const runBtn = document.getElementById('runSearchBtn');
+        const btnSpinner = document.getElementById('btnSpinner');
+        const btnText = document.getElementById('btnText');
+
+        if (!form || !runBtn || !btnSpinner || !btnText) {
+            console.warn('Search spinner elements not found');
+            return;
+        }
+
+        form.addEventListener('submit', function () {
+            runBtn.disabled = true;
+            btnSpinner.classList.remove('d-none');
+            btnText.textContent = 'Running…';
+        });
+    });
+</script>
 
 <script>
 // Simple client-side table sorting with support for summary/detail row pairs
