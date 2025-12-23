@@ -202,15 +202,15 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         $sparseQuery = $this->generateSparseVector($query);
 
         $documents = [];
-
         if ($this->isVectorDbEnabled()) {
             try {
                 $namespace = $projectIdentifier;
+                $candidateK = intval($this->getSystemSetting('hybrid_candidate_k') ?? 20);
 
                 // --- Dense semantic search ---
                 $denseResults = [];
                 try {
-                    $denseResults = $this->pineconeQuery($namespace, $queryEmbedding, $topK);
+                    $denseResults = $this->pineconeQuery($namespace, $queryEmbedding, $candidateK);
                 } catch (\Exception $e) {
                     $this->emError("Dense query failed: ".$e->getMessage());
                 }
@@ -218,13 +218,15 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 // --- Sparse keyword search ---
                 $sparseResults = [];
                 try {
-                    $sparseResults = $this->pineconeSparseQuery($namespace, $sparseQuery, $topK);
+                    $sparseResults = $this->pineconeSparseQuery($namespace, $sparseQuery, $candidateK);
                 } catch (\Exception $e) {
                     $this->emError("Sparse query failed: ".$e->getMessage());
                 }
 
                 // Normalize and combine
-                $combined = $this->mergeHybridResults($denseResults, $sparseResults , $topK);
+                $combined = $this->mergeHybridResults($denseResults, $sparseResults , $candidateK);
+                // Slice to final topK for RAG / caller
+                $combined = array_slice($combined, 0, $topK);
 
                 // Format top matches
                 $documents = [];
@@ -293,7 +295,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         foreach (($dense['matches'] ?? []) as $m) {
             $denseMap[$m['id']] = $m['score'];
         }
-        $this->emDebug("Dense map", $denseMap);
+        // $this->emDebug("Dense map", $denseMap);
 
         // Sparse map (id => score)
         $sparseMap = [];
@@ -301,7 +303,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
             $sparseNorm = log(1 + $m['score']);
             $sparseMap[$m['id']] = $sparseNorm;
         }
-        $this->emDebug("Sparse map", $sparseMap);
+        $this->emDebug("Sparse map", $sparse);
 
         // All IDs merged
         $allIds = array_unique(array_merge(array_keys($denseMap), array_keys($sparseMap)));
@@ -340,7 +342,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         // Sort by hybrid_score
         usort($merged, fn($a,$b) => ($b['hybrid_score'] <=> $a['hybrid_score']));
         $merged = array_slice($merged, 0, $topK);
-        $this->emDebug("Final merged (sorted)", $merged);
+        // $this->emDebug("Final merged (sorted)", $merged);
         return $merged;
     }
 
@@ -364,7 +366,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         if ($this->isVectorDbEnabled()) {
             $namespace = $projectIdentifier;
 
-            $sparse = $this->generateSparseVector($content);
+            $sparse = $this->generateSparseVector($content, 'passage');
 
             // Dense upsert (serverless)
             $this->pineconeUpsert($namespace, [
@@ -570,7 +572,10 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         return (bool)$this->getSystemSetting('use_vectordb');
     }
 
-    private function generateSparseVector(string $text): array {
+    /**
+     * Fallback to original TF-based sparse vector (keep as backup)
+     */
+    private function generateSparseVectorFallback(string $text): array {
         // Tokenize
         $words = preg_split('/\W+/u', strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
         if (empty($words)) {
@@ -619,6 +624,60 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         ];
     }
 
+    /**
+     * Generate sparse vector using Pinecone's pinecone-sparse-english-v0 model
+     */
+    private function generateSparseVector(string $text, string $inputType = 'query'): array
+    {
+        try {
+            $apiKey = $this->getSystemSetting('pinecone_api_key');
+            $embedHost = rtrim($this->getSystemSetting('pinecone_inference_host', 'https://api.pinecone.io'), '/');
+            
+            $client = new \GuzzleHttp\Client();
+            $body = [
+                'model' => 'pinecone-sparse-english-v0',
+                'parameters' => [
+                    'input_type' => $inputType,
+                    'truncate' => 'END'
+                ],
+                'inputs' => [['text' => $text]]
+            ];
+            
+            $resp = $client->post("$embedHost/embed", [
+                'headers' => [
+                    'Api-Key' => $apiKey,
+                    'Content-Type' => 'application/json',
+                    'X-Pinecone-Api-Version' => '2025-10'  
+                ],
+                'json' => $body
+            ]);
+            
+            $result = json_decode($resp->getBody(), true);
+            $this->emDebug("Pinecone raw response: " . json_encode($result));
+            
+            // FIXED: Correct response structure
+            if (isset($result['data'][0]['sparse_values']) && isset($result['data'][0]['sparse_indices'])) {
+                $sparse = [
+                    'indices' => $result['data'][0]['sparse_indices'],
+                    'values' => array_map(fn($v) => min(1.0, max(0.0, $v)), $result['data'][0]['sparse_values'])  // Normalize 0-1
+                ];
+                
+                // Sort for Pinecone
+                array_multisort($sparse['indices'], SORT_ASC, SORT_NUMERIC, $sparse['values']);
+                
+                $this->emDebug("Generated {$inputType} sparse: " . count($sparse['indices']) . " indices");
+                return $sparse;
+            }
+            
+            $this->emError("Unexpected Pinecone sparse response: " . json_encode($result));
+            return ['indices' => [], 'values' => []];
+            
+        } catch (Exception $e) {
+            $this->emError("Pinecone sparse ({$inputType}) failed: " . $e->getMessage());
+            return $this->generateSparseVectorFallback($text);
+        }
+    }
+
 
     private function pineconeSparseUpsert($namespace, $vectors) {
         $apiKey = $this->getSystemSetting('pinecone_api_key');
@@ -640,12 +699,11 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         return json_decode($resp->getBody(), true);
     }
 
-    private function pineconeSparseQuery($namespace, array $sparseVector, $topK = 3) {
+    private function pineconeSparseQuery($namespace, array $sparseVector, $topK = 20) {
         $apiKey = $this->getSystemSetting('pinecone_api_key');
         $host   = rtrim($this->getSystemSetting('pinecone_host_sparse'), '/');
 
         $client = new \GuzzleHttp\Client();
-
         $body = [
             'topK'            => $topK,
             'namespace'       => $namespace,
@@ -684,7 +742,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         return json_decode($resp->getBody(), true);
     }
 
-    private function pineconeQuery($namespace, $embedding, $topK = 3) {
+    private function pineconeQuery($namespace, $embedding, $topK = 20) {
         $apiKey = $this->getSystemSetting('pinecone_api_key');
         $host   = rtrim($this->getSystemSetting('pinecone_host'), '/');
 
@@ -1127,11 +1185,12 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
         if ($this->isVectorDbEnabled()) {
             try {
                 $namespace = $projectIdentifier;
+                $candidateK = intval($this->getSystemSetting('hybrid_candidate_k') ?? 20);
 
                 // --- Dense search ---
                 $denseResults = [];
                 try {
-                    $denseResults = $this->pineconeQuery($namespace, $queryEmbedding, $topK);
+                    $denseResults = $this->pineconeQuery($namespace, $queryEmbedding, $candidateK);
                 } catch (\Exception $e) {
                     $this->emError("debug dense query failed: ".$e->getMessage());
                 }
@@ -1139,16 +1198,19 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 // --- Sparse search ---
                 $sparseResults = [];
                 try {
-                    $sparseResults = $this->pineconeSparseQuery($namespace, $sparseQuery, $topK);
+                    $sparseResults = $this->pineconeSparseQuery($namespace, $sparseQuery, $candidateK);
                 } catch (\Exception $e) {
                     $this->emError("debug sparse query failed: ".$e->getMessage());
                 }
 
 
-                $this->emDebug("denseResults", $denseResults);
-                $this->emDebug("sparseResults", $sparseResults);
+                // $this->emDebug("denseResults", $denseResults);
+                // $this->emDebug("sparseResults", $sparseResults);
+
                 // --- Merge ---
-                $merged = $this->mergeHybridResults($denseResults, $sparseResults, $topK);
+                $merged = $this->mergeHybridResults($denseResults, $sparseResults, $candidateK);
+                // Slice to final topK for RAG / caller
+                $merged = array_slice($merged, 0, $topK);
 
                 $documents = [];
                 foreach ($merged as $m) {

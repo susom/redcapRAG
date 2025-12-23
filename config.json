@@ -75,6 +75,12 @@
             "type": "checkbox"
         },
         {
+            "key": "pinecone_inference_host",
+            "name": "Pinecone Inference/Embeddings API Endpoint <br><i>Required if Vector DB is enabled</i>",
+            "required": false,
+            "type": "text"
+        },
+        {
             "key": "pinecone_host",
             "name": "Pinecone Host (Dense) Endpoint <br><i>Required if Vector DB is enabled</i>",
             "required": false,
@@ -85,6 +91,13 @@
             "name": "Pinecone Host (Sparse) Endpoint <br><i>Required if Vector DB is enabled</i>",
             "required": false,
             "type": "text"
+        },
+        {
+            "key": "hybrid_candidate_k",
+            "name": "Hybrid Search: Retrieval K <br><i>Number of dense+sparse candidates before hybrid merge</i>",
+            "type": "text",
+            "required": false,
+            "default": "20"
         },
         {
             "key": "hybrid_dense_weight",
