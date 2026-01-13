@@ -154,7 +154,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     /**
      *
      */
-    private function getEmbedding($text) {
+    private function getEmbedding($text, &$errorMsg = null) {
         try {
             // Call the embedding API
             $result = $this->getSecureChatInstance()->callAI("ada-002", array("input" => $text));
@@ -167,10 +167,12 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 $this->emDebug("Generated embedding for content: " . substr($text, 0, 100));
                 return $result['data'][0]['embedding'];
             } else {
-                $this->emError("Unexpected API response: " . json_encode($result));
+                $errorMsg = "Unexpected embedding API response: " . json_encode($result);
+                $this->emError($errorMsg);
             }
         } catch (\Exception $e) {
-            $this->emError("Failed to generate embedding: " . $e->getMessage());
+            $errorMsg = "Embedding API exception: " . $e->getMessage();
+            $this->emError($errorMsg);
         }
         return null; // Return null if embedding generation fails
     }
@@ -354,11 +356,14 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
      * @param string $content
      * @return void
      */
-    public function storeDocument($projectIdentifier, $title, $content, $dateCreated = null) {
-        $embedding = $this->getEmbedding($content);
+    public function storeDocument($projectIdentifier, $title, $content, $dateCreated = null, &$errorMsg = null) {
+        $embedding = $this->getEmbedding($content, $errorMsg);
         if (!$embedding) {
-            $this->emError("Failed to generate embedding for content.");
-            return;
+            if (!$errorMsg) {
+                $errorMsg = "Failed to generate embedding (unknown reason)";
+            }
+            $this->emError($errorMsg);
+            return false;
         }
         $serialized_embedding = json_encode($embedding);
         $contentHash = hash('sha256', $content);
@@ -368,38 +373,44 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
             $sparse = $this->generateSparseVector($content, 'passage');
 
-            // Dense upsert (serverless)
-            $this->pineconeUpsert($namespace, [
-                [
-                    "id"     => $contentHash,
-                    "values" => $embedding,
-                    "metadata" => [
-                        "title"     => $title,
-                        "content"   => $content,
-                        "source"    => $title,
-                        "hash"      => $contentHash,
-                        "timestamp" => $dateCreated ?? time(),
+            try {
+                // Dense upsert (serverless)
+                $this->pineconeUpsert($namespace, [
+                    [
+                        "id"     => $contentHash,
+                        "values" => $embedding,
+                        "metadata" => [
+                            "title"     => $title,
+                            "content"   => $content,
+                            "source"    => $title,
+                            "hash"      => $contentHash,
+                            "timestamp" => $dateCreated ?? time(),
+                        ]
                     ]
-                ]
-            ]);
+                ]);
 
-            // Sparse upsert (pod index)
-            $this->pineconeSparseUpsert($namespace, [
-                [
-                    "id"           => $contentHash,
-                    "sparse_values"=> $sparse,
-                    "metadata"     => [
-                        "title"     => $title,
-                        "content"   => $content,
-                        "source"    => $title,
-                        "hash"      => $contentHash,
-                        "timestamp" => $dateCreated ?? time(),
+                // Sparse upsert (pod index)
+                $this->pineconeSparseUpsert($namespace, [
+                    [
+                        "id"           => $contentHash,
+                        "sparse_values"=> $sparse,
+                        "metadata"     => [
+                            "title"     => $title,
+                            "content"   => $content,
+                            "source"    => $title,
+                            "hash"      => $contentHash,
+                            "timestamp" => $dateCreated ?? time(),
+                        ]
                     ]
-                ]
-            ]);
+                ]);
 
-            $this->emDebug("Pinecone upserted chunk $contentHash in namespace $namespace");
-            return;
+                $this->emDebug("Pinecone upserted chunk $contentHash in namespace $namespace");
+                return true;
+            } catch (\Exception $e) {
+                $errorMsg = "Failed to upsert to Pinecone: " . $e->getMessage();
+                $this->emError($errorMsg);
+                return false;
+            }
         } else {
             // Handle deduplication in the Entity Table
             try {
@@ -411,7 +422,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
                 if ($result->num_rows > 0) {
                     $this->emDebug("Document already exists in Entity Table for project {$projectIdentifier}. Skipping.");
-                    return; // Skip storing duplicate
+                    return true; // Skip storing duplicate (consider this success)
                 }
 
                 $entityFactory = $this->getEntityFactory();
@@ -439,20 +450,29 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
                 // $this->emDebug("Attempting to set data:", $data);
                 if (!$entity->setData($data)) {
-                    $this->emError("Set data failed:", $entity->getErrors());
+                    $errorMsg = "Set data failed: " . json_encode($entity->getErrors());
+                    $this->emError($errorMsg);
+                    return false;
                 } else {
                     try {
                         if ($entity->save()) {
                             // $this->emDebug("Entity saved successfully.", $entity->getData());
+                            return true;
                         } else {
-                            $this->emError("Save failed.");
+                            $errorMsg = "Entity save failed (no exception thrown)";
+                            $this->emError($errorMsg);
+                            return false;
                         }
                     } catch (\Exception $e) {
-                        $this->emError("Entity save exception: " . $e->getMessage());
+                        $errorMsg = "Entity save exception: " . $e->getMessage();
+                        $this->emError($errorMsg);
+                        return false;
                     }
                 }
             } catch (\Exception $e) {
-                $this->emError("Failed to store document in Entity Table: " . $e->getMessage());
+                $errorMsg = "Failed to store document in Entity Table: " . $e->getMessage();
+                $this->emError($errorMsg);
+                return false;
             }
         }
     }
