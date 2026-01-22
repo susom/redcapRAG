@@ -235,7 +235,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 foreach ($combined as $m) {
                     $meta = $m['metadata'] ?? [];
 
-                    $documents[] = [
+                    $documents[] = array_merge([
                         'id'            => $m['id'] ?? null,
                         'content'       => $meta['content'] ?? '',
                         'source'        => $meta['source'] ?? '',
@@ -245,7 +245,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                         'dense'         => $m['dense_score']  ?? null,
                         'sparse'        => $m['sparse_score'] ?? null,
                         'similarity'    => $m['hybrid_score'] ?? 0,
-                    ];
+                    ], $meta); 
                 }
 
                 return $documents;
@@ -356,7 +356,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
      * @param string $content
      * @return void
      */
-    public function storeDocument($projectIdentifier, $title, $content, $dateCreated = null, &$errorMsg = null) {
+    public function storeDocument($projectIdentifier, $title, $content, $dateCreated = null, &$errorMsg = null, $customMeta = []) {
         $embedding = $this->getEmbedding($content, $errorMsg);
         if (!$embedding) {
             if (!$errorMsg) {
@@ -379,13 +379,13 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                     [
                         "id"     => $contentHash,
                         "values" => $embedding,
-                        "metadata" => [
+                        "metadata" => array_merge([
                             "title"     => $title,
                             "content"   => $content,
                             "source"    => $title,
                             "hash"      => $contentHash,
                             "timestamp" => $dateCreated ?? time(),
-                        ]
+                        ], $customMeta) 
                     ]
                 ]);
 
@@ -394,13 +394,13 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                     [
                         "id"           => $contentHash,
                         "sparse_values"=> $sparse,
-                        "metadata"     => [
+                        "metadata"     => array_merge([
                             "title"     => $title,
                             "content"   => $content,
                             "source"    => $title,
                             "hash"      => $contentHash,
                             "timestamp" => $dateCreated ?? time(),
-                        ]
+                        ], $customMeta) 
                     ]
                 ]);
 
