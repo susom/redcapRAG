@@ -25,7 +25,7 @@
         }
     ],
 
-    "framework-version": 9,
+    "framework-version": 14,
 
 	"permissions": [
 		"redcap_module_system_enable",
@@ -52,12 +52,25 @@
 
 	],
 
+	"api-actions": {
+		"storeDocument": {
+			"description": "Store a single document/section to RAG vector database",
+			"access": ["auth"]
+		}
+	},
+
 	"project-settings": [
 		{
 			"key": "enable-project-debug-logging",
 			"name": "<b>Enable Debug Logging</b><br><i>(optional)</i> Requires installation and configuration of emLogger",
 			"required": false,
 			"type": "checkbox"
+		},
+		{
+			"key": "rag_target_namespace",
+			"name": "<b>REXI RAG target Namespace</b><br><i>Pinecone namespace used for REXI RAG ingestion. (SPECIAL USE CASE)</i>",
+			"required": false,
+			"type": "text"
 		}
 	],
 

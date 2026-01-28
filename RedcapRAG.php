@@ -1325,4 +1325,108 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     public function setSecureChatInstance(\Stanford\SecureChatAI\SecureChatAI $secureChatInstance): void {
         $this->secureChatInstance = $secureChatInstance;
     }
+
+    /**
+     * REDCap Module API Handler
+     *
+     * Provides authenticated API endpoints for external services (e.g., content pipeline).
+     * Called via: POST /api/ with token, content=externalModule, prefix=redcap_rag, action=storeDocument
+     *
+     * @param string|null $action The API action to perform
+     * @param array $payload Request payload
+     * @return array Response with status, body, and headers
+     */
+    public function redcap_module_api($action = null, $payload = [])
+    {
+        // Normalize action from POST if not passed directly
+        if (empty($action) && isset($_POST['action'])) {
+            $action = $_POST['action'];
+        }
+
+        // Normalize payload from JSON or POST
+        if (empty($payload)) {
+            $raw = file_get_contents("php://input");
+            $decoded = $raw ? json_decode($raw, true) : [];
+            $payload = (json_last_error() === JSON_ERROR_NONE) ? $decoded : $_POST;
+        }
+
+        // Determine namespace from project settings (token provides project context)
+        $namespace = $this->getProjectSetting('rag_target_namespace');
+        if (!$namespace) {
+            // Fallback to project ID if no namespace configured
+            $project_id = $this->getProjectId();
+            $namespace = $project_id ? "project_" . $project_id : "default";
+        }
+
+        switch ($action) {
+            case "storeDocument":
+                $title = $payload['title'] ?? null;
+                $text = $payload['text'] ?? null;  // Use 'text' to avoid conflict with REDCap's 'content' param
+                $dateCreated = $payload['dateCreated'] ?? null;
+
+                // Handle metadata as JSON string or array
+                $metadata = $payload['metadata'] ?? [];
+                if (is_string($metadata)) {
+                    $decoded = json_decode($metadata, true);
+                    if (json_last_error() === JSON_ERROR_NONE) {
+                        $metadata = $decoded;
+                    }
+                }
+
+                // Validate required fields
+                if (!$title || !$text) {
+                    return [
+                        "status"  => 400,
+                        "body"    => json_encode([
+                            "error" => "Missing required fields: title and text are required"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                }
+
+                // Attempt to store document
+                $errorMsg = null;
+                $success = $this->storeDocument(
+                    $namespace,
+                    $title,
+                    $text,
+                    $dateCreated,
+                    $errorMsg,
+                    $metadata
+                );
+
+                if ($success) {
+                    return [
+                        "status"  => 200,
+                        "body"    => json_encode([
+                            "status" => "success",
+                            "namespace" => $namespace,
+                            "title" => $title,
+                            "message" => "Document stored successfully"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                } else {
+                    return [
+                        "status"  => 500,
+                        "body"    => json_encode([
+                            "status" => "error",
+                            "namespace" => $namespace,
+                            "title" => $title,
+                            "error" => $errorMsg ?? "Failed to store document (unknown error)"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                }
+
+            default:
+                return [
+                    "status"  => 400,
+                    "body"    => json_encode([
+                        "error" => "Action $action not defined"
+                    ]),
+                    "headers" => ["Content-Type" => "application/json"]
+                ];
+        }
+    }
 }
