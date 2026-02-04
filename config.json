@@ -31,14 +31,15 @@
 
 	"links": {
 		"project": [
-
+			{
+				"name": "RAG Document Management",
+				"icon": "fas fa-database",
+				"url": "pages/ragit.php",
+				"show-header-and-footer": false
+			}
 		],
 		"control-center": [
-            {
-                "name": "RAG Debug",
-                "icon": "fas fa-database",
-                "url": "pages/ragit.php"
-            }
+
 		]
 	},
 

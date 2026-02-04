@@ -1,748 +1,734 @@
 <?php
 /** @var \Stanford\RedcapRAG\RedcapRAG $module */
 
-// Basic access control
+// Basic access control (tighten if needed)
 if (!SUPER_USER && !USERID) {
     exit("Access denied");
 }
 
-// Selected namespace / project identifier
-$projectIdentifier = trim($_POST['project_identifier'] ?? '');
-$namespaces = $module->getPineconeNamespaces();
-$action  = $_POST['action'] ?? null;
-$results = null;
-$rows    = [];
-$message = null;
+$current_pid = isset($_GET['pid']) ? $_GET['pid'] : null;
 
-// Only run actions when a namespace is set
-if ($projectIdentifier !== '') {
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-
-        // Delete a single document
-        if ($action === 'delete' && !empty($_POST['doc_id'])) {
-            $module->deleteContextDocument($projectIdentifier, $_POST['doc_id']);
-            $message = "Document deleted.";
-        }
-
-        // Purge entire namespace
-        if ($action === 'purge' &&
-            !empty($_POST['confirm']) &&
-            $_POST['confirm'] === $projectIdentifier) {
-
-            $module->purgeContextNamespace($projectIdentifier);
-
-            // Redirect to preserve namespace in query string and clear POST
-            $url = $_SERVER['PHP_SELF'] . '?project_identifier=' . urlencode($projectIdentifier);
-            header("Location: {$url}");
-            exit;
-        }
-
-        // Search
-        if ($action === 'search' && !empty($_POST['query'])) {
-            $topK = isset($_POST['top_k']) ? max(1, (int)$_POST['top_k']) : 20;
-            $results = $module->debugSearchContext($projectIdentifier, $_POST['query'], $topK);
-        }
-    }
-
-    // Refresh list of stored docs for current namespace
-    $rows = $module->listContextDocuments($projectIdentifier);
+// Get namespace from project settings, fallback to project_{pid}
+$projectIdentifier = $module->getProjectSetting("rag_target_namespace", $current_pid);
+if (empty($projectIdentifier) && !empty($current_pid)) {
+    $projectIdentifier = "project_" . $current_pid;
 }
 
-/**
- * Simple blue-intensity heatmap style for numeric scores in [0, 1].
- *
- * @param mixed $score
- * @return string
- */
-function ragHeatStyle($score): string
-{
-    if (!is_numeric($score)) {
-        return '';
-    }
-    $v = max(0.0, min(1.0, (float)$score)); // clamp 0–1
-    $alpha = 0.15 + 0.7 * $v;               // avoid fully transparent or fully opaque
-    $bg = "rgba(13,110,253,{$alpha})";      // Bootstrap primary-ish blue
-    $color = ($v >= 0.5) ? '#ffffff' : '#000000';
-
-    return "background-color: {$bg}; color: {$color};";
+if (empty($projectIdentifier)) {
+    echo "<h2>No RAG namespace configured. Please configure 'RAG target Namespace' in project settings.</h2>";
+    exit;
 }
 
+$action    = $_POST['action'] ?? null;
+$results   = null;
+$rows      = [];
+$ingestLog = "";
+
+// Heat-map helper for scores
+function ragScoreClass(?float $val): string {
+    if ($val === null) return '';
+    if ($val >= 0.85)   return 'score-high';
+    if ($val >= 0.7)    return 'score-mid';
+    return 'score-low';
+}
+
+// Decide default active tab
+$activeTab = 'ingest';
+if ($action === 'search') {
+    $activeTab = 'search';
+} elseif (in_array($action, ['delete', 'purge'], true)) {
+    $activeTab = 'docs';
+} elseif ($action === 'ingest') {
+    $activeTab = 'ingest';
+}
+
+// Handle POST
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    // Ingest JSON files into RAG
+    if ($action === 'ingest' && isset($_FILES['rag_files'])) {
+        set_time_limit(300);
+
+        $ingestLog .= "Processing Uploaded Files...\n\n";
+
+        $files = $_FILES['rag_files'];
+
+        $maxFiles = 5;
+        $count = is_array($files['name']) ? count($files['name']) : 0;
+
+        if ($count > $maxFiles) {
+            $ingestLog .= "You uploaded {$count} files. Only the first {$maxFiles} will be processed.\n\n";
+            $count = $maxFiles;
+        }
+
+        for ($i = 0; $i < $count; $i++) {
+            $name = $files['name'][$i];
+            $tmp  = $files['tmp_name'][$i];
+
+            if (!is_uploaded_file($tmp)) {
+                $ingestLog .= "File: {$name}\n  ❌ Upload error. Skipping.\n\n";
+                continue;
+            }
+
+            $ingestLog .= "File: {$name}\n";
+
+            $raw = file_get_contents($tmp);
+            $json = json_decode($raw, true);
+
+            if (!$json) {
+                $ingestLog .= "  ❌ Failed to parse JSON. Skipping.\n\n";
+                continue;
+            }
+
+            // Support new rpp.v1 structure
+            $documents = $json['documents'] ?? [];
+
+            if (empty($documents)) {
+                $ingestLog .= "  ❌ No 'documents' array found in JSON. Skipping.\n\n";
+                continue;
+            }
+
+            $sectionCount = 0;
+            $successCount = 0;
+            $failCount = 0;
+
+            // Process each document
+            foreach ($documents as $document) {
+                $doc_id     = $document['doc_id'] ?? 'unknown';
+                $source     = $document['source'] ?? [];
+                $source_uri = $source['uri'] ?? '';
+                $source_type = $source['type'] ?? 'unknown';
+                $sections   = $document['sections'] ?? [];
+
+                // Process each section as a RAG document
+                foreach ($sections as $section) {
+                    $section_id = $section['section_id'] ?? 'unknown';
+                    $text       = $section['text'] ?? '';
+
+                    if (empty($text)) {
+                        continue; // Skip empty sections
+                    }
+
+                    $sectionCount++;
+
+                    // Use section_id as title (more descriptive than doc_id)
+                    $title = $section_id;
+
+                    // Build metadata (flatten nested objects for Pinecone)
+                    $meta = [
+                        'doc_id'      => $doc_id,
+                        'section_id'  => $section_id,
+                        'source_type' => $source_type,
+                        'source_uri'  => $source_uri,
+                        'file'        => $name,
+                    ];
+
+                    // Add section version/update if present
+                    if (!empty($section['section_version'])) {
+                        $meta['section_version'] = $section['section_version'];
+                    }
+                    if (!empty($section['section_updated'])) {
+                        $meta['section_updated'] = $section['section_updated'];
+                    }
+
+                    // Flatten location (Pinecone doesn't accept nested objects)
+                    if (!empty($section['location'])) {
+                        $loc = $section['location'];
+                        if (isset($loc['page'])) $meta['location_page'] = $loc['page'];
+                        if (isset($loc['section_title'])) $meta['location_section_title'] = $loc['section_title'];
+                        if (isset($loc['window_index'])) $meta['location_window_index'] = $loc['window_index'];
+                    }
+
+                    // Flatten AI metadata (optional - for debugging/auditing)
+                    if (!empty($section['ai'])) {
+                        $ai = $section['ai'];
+                        if (isset($ai['normalized'])) $meta['ai_normalized'] = $ai['normalized'];
+                        if (isset($ai['trigger_reason'])) $meta['ai_trigger_reason'] = $ai['trigger_reason'];
+                    }
+
+                    $doc = $text;
+
+                    // Attempt to store with retry logic for rate limiting
+                    $errorMsg = null;
+                    $success = false;
+                    $maxRetries = 4; // Increased from 3 since we have time
+
+                    for ($retry = 0; $retry < $maxRetries; $retry++) {
+                        $success = $module->storeDocument($projectIdentifier, $title, $doc, null, $errorMsg, $meta);
+
+                        if ($success) {
+                            break;
+                        }
+
+                        // If rate limited, wait longer before retry
+                        if ($retry < $maxRetries - 1 && $errorMsg && stripos($errorMsg, 'network') !== false) {
+                            $waitTime = (int)pow(2, $retry + 1) * 5; // Exponential backoff: 10s, 20s, 40s
+                            $ingestLog .= "    ⏳ Rate limit hit on {$section_id}, waiting {$waitTime}s before retry " . ($retry + 2) . "/{$maxRetries}\n";
+                            sleep($waitTime);
+                        }
+                    }
+
+                    if ($success) {
+                        $successCount++;
+                    } else {
+                        $failCount++;
+                        $textLen = strlen($text);
+                        $docLen = strlen($doc);
+                        $tokenEstimate = (int)($docLen / 4); // Rough estimate: 1 token ≈ 4 chars
+                        $ingestLog .= "    ⚠️  Failed to ingest section: {$section_id} (after {$maxRetries} attempts)\n";
+                        $ingestLog .= "       Length: {$textLen} chars (+ metadata = {$docLen} chars, ~{$tokenEstimate} tokens)\n";
+                        if ($errorMsg) {
+                            $ingestLog .= "       Error: {$errorMsg}\n";
+                        }
+                    }
+
+                    // Add delay between API calls to prevent rate limiting
+                    // 4000ms = 4 seconds (conservative for occasional bulk ingestion)
+                    usleep(4000000);
+                }
+            }
+
+            if ($failCount > 0) {
+                $ingestLog .= "  ⚠️  Partially completed {$name}: {$successCount}/{$sectionCount} sections succeeded, {$failCount} failed\n\n";
+            } else {
+                $ingestLog .= "  ✅ Finished ingesting {$name} ({$successCount}/{$sectionCount} sections)\n\n";
+            }
+        }
+
+        $ingestLog .= "All ingestion complete.\n";
+    }
+
+    // Delete single doc
+    if ($action === 'delete' && !empty($_POST['doc_id'])) {
+        $module->deleteContextDocument($projectIdentifier, $_POST['doc_id']);
+        header("Location: " . $_SERVER['REQUEST_URI']);
+        exit;
+    }
+
+    // Purge namespace
+    if (
+        $action === 'purge' &&
+        !empty($_POST['confirm']) &&
+        $_POST['confirm'] === $projectIdentifier
+    ) {
+        $module->purgeContextNamespace($projectIdentifier);
+        header("Location: " . $_SERVER['REQUEST_URI']);
+        exit;
+    }
+
+    // Search (hybrid dense+sparse)
+    if ($action === 'search' && !empty($_POST['query'])) {
+        $results = $module->debugSearchContext($projectIdentifier, $_POST['query'], 3);
+    }
+}
+
+// Always refresh docs for Docs tab
+$rows = $module->listContextDocuments($projectIdentifier);
 ?>
 <!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>REDCap RAG Debug Panel</title>
+    <title>RAG Document Management</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
 
-    <!-- Bootstrap 5 (CSS) -->
+    <!-- Bootstrap 5 -->
     <link
         href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
         rel="stylesheet"
         integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
         crossorigin="anonymous"
     >
-
     <style>
         body {
             padding: 20px;
         }
-        .score-cell {
-            text-align: right;
-            white-space: nowrap;
-        }
-        .snippet-cell {
-            max-width: 420px;
-            white-space: nowrap;
-            text-overflow: ellipsis;
-            overflow: hidden;
-        }
-        .table thead th {
+        .score-high { background: #d4edda; }
+        .score-mid  { background: #fff3cd; }
+        .score-low  { background: #f8d7da; }
+
+        th[data-sort-key] {
             cursor: pointer;
-            user-select: none;
+            white-space: nowrap;
         }
-        .table thead th.sortable::after {
-            content: " ⇅";
+        th[data-sort-key]::after {
+            content: ' ⇅';
             font-size: 0.75rem;
-            opacity: 0.4;
+            color: #999;
         }
-        .table thead th.sort-asc::after {
-            content: " ↑";
-            opacity: 0.8;
+        .table-fixed-header thead th {
+            position: sticky;
+            top: 0;
+            background-color: #f8f9fa;
+            z-index: 2;
         }
-        .table thead th.sort-desc::after {
-            content: " ↓";
-            opacity: 0.8;
+        .content-preview {
+            font-family: monospace;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 480px;
         }
-        .badge-namespace {
-            font-size: 0.9rem;
+        pre.small-pre {
+            font-size: 0.8rem;
+            white-space: pre-wrap;
         }
     </style>
 </head>
 <body>
 
 <div class="container-fluid">
-    <h2 class="mb-3">REDCap RAG Debug Panel</h2>
-
-    <!-- Namespace selector -->
-    <div class="row mb-4">
-        <!-- LEFT: Namespace selector -->
-        <div class="col-md-6">
-            <div class="card mb-4 h-100">
-                <div class="card-body">
-                    <form class="row g-3" method="post">
-                        <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
-
-                        <div class="col-md-6 col-lg-8">
-                            <label for="project_identifier" class="form-label">
-                                Namespace / Project Identifier
-                            </label>
-
-                            <select
-                                class="form-select"
-                                id="project_identifier"
-                                name="project_identifier"
-                            >
-                                <option value="">Select a namespace…</option>
-
-                                <?php foreach ($namespaces as $namespace): ?>
-                                    <option
-                                        value="<?= htmlspecialchars($namespace['name']) ?>"
-                                        <?= $namespace['name'] === $projectIdentifier ? 'selected' : '' ?>
-                                    >
-                                        <?= htmlspecialchars($namespace['name']) ?>
-                                        (<?= (int) $namespace['record_count'] ?> records)
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-
-                        <div class="col-md-4 align-self-end">
-                            <button type="submit" class="btn btn-primary">
-                                Load Namespace
-                            </button>
-                        </div>
-                    </form>
-
-                    <?php if ($projectIdentifier !== ''): ?>
-                        <div class="mt-3">
-                        <span class="badge bg-secondary badge-namespace">
-                            Current namespace: <?= htmlspecialchars($projectIdentifier) ?>
-                        </span>
-                        </div>
-                    <?php else: ?>
-                        <div class="mt-3 text-muted">
-                            Enter a namespace to view stored documents and run test searches.
-                        </div>
-                    <?php endif; ?>
-                </div>
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+            <h2 class="mb-0">RAG Document Management</h2>
+            <div class="text-muted small">
+                Namespace: <code><?= htmlspecialchars($projectIdentifier) ?></code>
             </div>
         </div>
-
-        <!-- RIGHT: Purge namespace -->
-        <div class="col-md-6">
-            <div class="card mb-4 border-danger h-100">
-                <div class="card-header bg-danger text-white">
-                    Purge Namespace
-                </div>
-                <div class="card-body">
-                    <p class="mb-2">
-                        This will permanently delete all context vectors for
-                        <strong><?= htmlspecialchars($projectIdentifier) ?></strong>.
-                    </p>
-                    <p class="small text-muted">
-                        Type the namespace exactly to confirm.
-                    </p>
-
-                    <form class="row g-3" method="post">
-                        <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
-                        <input type="hidden" name="action" value="purge">
-                        <input type="hidden" name="project_identifier" value="<?= htmlspecialchars($projectIdentifier) ?>">
-
-                        <div class="col-md-7">
-                            <input
-                                type="text"
-                                class="form-control"
-                                name="confirm"
-                                placeholder="<?= htmlspecialchars($projectIdentifier) ?>"
-                            >
-                        </div>
-
-                        <div class="col-md-5">
-                            <button
-                                type="submit"
-                                class="btn btn-outline-danger w-100"
-                                onclick="return confirm('Delete all vectors for this namespace?');"
-                            >
-                                Purge All
-                            </button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>
+        <span class="badge bg-secondary align-self-start mt-2">Hybrid Dense + Sparse</span>
     </div>
 
-    <?php if ($message): ?>
-        <div class="alert alert-info"><?= htmlspecialchars($message) ?></div>
-    <?php endif; ?>
+    <!-- Tabs -->
+    <ul class="nav nav-tabs mb-3" id="ragTab" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button
+                class="nav-link <?= $activeTab === 'ingest' ? 'active' : '' ?>"
+                id="tab-ingest"
+                data-bs-toggle="tab"
+                data-bs-target="#pane-ingest"
+                type="button"
+                role="tab"
+                aria-controls="pane-ingest"
+                aria-selected="<?= $activeTab === 'ingest' ? 'true' : 'false' ?>"
+            >
+                Ingest JSON
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button
+                class="nav-link <?= $activeTab === 'search' ? 'active' : '' ?>"
+                id="tab-search"
+                data-bs-toggle="tab"
+                data-bs-target="#pane-search"
+                type="button"
+                role="tab"
+                aria-controls="pane-search"
+                aria-selected="<?= $activeTab === 'search' ? 'true' : 'false' ?>"
+            >
+                Search / Debug
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button
+                class="nav-link <?= $activeTab === 'docs' ? 'active' : '' ?>"
+                id="tab-docs"
+                data-bs-toggle="tab"
+                data-bs-target="#pane-docs"
+                type="button"
+                role="tab"
+                aria-controls="pane-docs"
+                aria-selected="<?= $activeTab === 'docs' ? 'true' : 'false' ?>"
+            >
+                Stored Docs / Purge
+            </button>
+        </li>
+    </ul>
 
-    <?php if ($projectIdentifier !== ''): ?>
+    <div class="tab-content" id="ragTabContent">
 
-        <!-- Search card -->
-        <div  class="card mb-4">
-            <div class="card-header">
-                Vector Search Test
-            </div>
-            <div class="card-body">
-                <form id="searchForm" class="row g-3" method="post">
-                    <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
-                    <input type="hidden" name="action" value="search">
-                    <input type="hidden" name="project_identifier" value="<?= htmlspecialchars($projectIdentifier) ?>">
+        <!-- Ingest Tab -->
+        <div
+            class="tab-pane fade <?= $activeTab === 'ingest' ? 'show active' : '' ?>"
+            id="pane-ingest"
+            role="tabpanel"
+            aria-labelledby="tab-ingest"
+        >
+            <div class="card shadow-sm mb-3">
+                <div class="card-header">
+                    <strong>RAG Document Ingestion</strong>
+                </div>
+                <div class="card-body">
+                    <p>
+                        This ingests JSON RAG documents into the scope of this project:
+                    </p>
+                    <ul>
+                        <li>
+                            <strong>Project Identifier:</strong>
+                            <code><?= htmlspecialchars($projectIdentifier) ?></code>
+                        </li>
+                    </ul>
 
-                    <div class="col-md-7 col-lg-8">
-                        <label class="form-label" for="query">Query text</label>
-                        <input
-                            type="text"
-                            class="form-control"
-                            id="query"
-                            name="query"
-                            value="<?= isset($_POST['query']) ? htmlspecialchars($_POST['query']) : '' ?>"
-                            placeholder="Enter a test question or phrase"
-                        >
-                    </div>
-
-                    <div class="col-md-2 col-lg-1">
-                        <label class="form-label" for="top_k"
-                               data-bs-toggle="tooltip"
-                               data-bs-html="true"
-                               title="Top K: The number of highest scoring results to return from the hybrid search.">
-                            Top K
-                        </label>
-                        <input
-                            type="number"
-                            class="form-control"
-                            id="top_k"
-                            name="top_k"
-                            min="1"
-                            max="20"
-                            value="<?= isset($_POST['top_k']) ? (int)$_POST['top_k'] : 5 ?>"
-                        >
-                    </div>
-
-                    <div class="col-md-3 col-lg-3 d-flex align-items-end">
-                        <button type="submit" class="btn btn-success" id="runSearchBtn">
-                            <span id="btnText">Run Search</span>
-                            <span id="btnSpinner" class="spinner-border spinner-border-sm ms-2 d-none" role="status" aria-hidden="true"></span>
-                        </button>
-                    </div>
-                </form>
-
-                <?php if (is_array($results)): ?>
-                    <hr>
-                    <h5 class="mb-3" >
-                        Search Results
-                        <?php if (!empty($_POST['query'])): ?>
-                            <small class="text-muted">
-                                for "<?= htmlspecialchars($_POST['query']) ?>"
-                            </small>
-                        <?php endif; ?>
-                    </h5>
-
-                    <?php if (count($results)): ?>
-                        <div class="table-responsive" style="max-height: calc(100vh - 600px); overflow-y: auto;">
-                            <table
-                                id="searchResultsTable"
-                                class="table table-sm table-hover align-middle"
-                                data-sortable-table="1"
+                    <form method="POST" enctype="multipart/form-data" class="mb-3">
+                        <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
+                        <input type="hidden" name="action" value="ingest">
+                        <div class="mb-2">
+                            <label class="form-label">
+                                Select one or more <code>.json</code> files to ingest:
+                            </label>
+                            <input
+                                type="file"
+                                name="rag_files[]"
+                                accept=".json"
+                                multiple
+                                required
+                                class="form-control"
                             >
-                                <thead class="table-light">
-                                <tr>
-                                    <th scope="col" class="sortable" data-sort-key="id">ID</th>
-                                    <th
-                                        scope="col"
-                                        class="sortable text-end"
-                                        data-sort-key="dense"
-                                        data-bs-toggle="tooltip"
-                                        data-bs-placement="top"
-                                        data-bs-html="true"
-                                        title="
-        <strong>Dense Score</strong><br>
-        Measures semantic similarity using vector embeddings.<br>
-        <em>Scale:</em> 0.0 – 1.0 (higher = more similar)
-    "
-                                    >
-                                        Dense
-                                    </th>
-
-                                    <th
-                                        scope="col"
-                                        class="sortable text-end"
-                                        data-sort-key="sparse"
-                                        data-bs-toggle="tooltip"
-                                        data-bs-placement="top"
-                                        data-bs-html="true"
-                                        title="
-        <strong>Sparse Score</strong><br>
-        Measures keyword overlap using term-based search (e.g. BM25).<br>
-        <em>Scale:</em> ≥ 0 (higher = more keyword matches)
-    "
-                                    >
-                                        Sparse
-                                    </th>
-
-                                    <th
-                                        scope="col"
-                                        class="sortable text-end"
-                                        data-sort-key="similarity"
-                                        data-bs-toggle="tooltip"
-                                        data-bs-placement="top"
-                                        data-bs-html="true"
-                                        title="
-        <strong>Hybrid Score</strong><br>
-        Combined relevance score from dense + sparse search.<br>
-        <em>Scale:</em> normalized (higher = more relevant), Current weights are 0.6 dense + 0.4 sparse
-    "
-                                    >
-                                        Hybrid
-                                    </th>
-                                    <th scope="col">Content snippet</th>
-                                    <th scope="col" style="width: 1%;"></th>
-                                </tr>
-                                </thead>
-                                <tbody>
-                                <?php foreach ($results as $idx => $r): ?>
-                                    <?php
-                                    $dense = isset($r['dense']) ? (float)$r['dense'] : null;
-                                    $sparse = isset($r['sparse']) ? (float)$r['sparse'] : null;
-                                    $hybrid = isset($r['similarity']) ? (float)$r['similarity'] : null;
-                                    $snippet = mb_substr($r['content'] ?? '', 0, 200);
-                                    $detailId = 'search-detail-' . $idx;
-                                    ?>
-                                    <tr data-row-type="summary">
-                                        <td
-                                            data-sort-field="id"
-                                            data-sort-value="<?= htmlspecialchars($r['id'] ?? '') ?>"
-                                            class="text-monospace small"
-                                        >
-                                            <?= htmlspecialchars($r['id'] ?? '') ?>
-                                        </td>
-                                        <td
-                                            class="score-cell"
-                                            data-sort-field="dense"
-                                            data-sort-value="<?= $dense !== null ? $dense : '' ?>"
-                                            style="<?= ragHeatStyle($dense) ?>"
-                                        >
-                                            <?= $dense !== null ? number_format($dense, 4) : '-' ?>
-                                        </td>
-                                        <td
-                                            class="score-cell"
-                                            data-sort-field="sparse"
-                                            data-sort-value="<?= $sparse !== null ? $sparse : '' ?>"
-                                            style="<?= ragHeatStyle($sparse) ?>"
-                                        >
-                                            <?= $sparse !== null ? number_format($sparse, 4) : '-' ?>
-                                        </td>
-                                        <td
-                                            class="score-cell fw-semibold"
-                                            data-sort-field="similarity"
-                                            data-sort-value="<?= $hybrid !== null ? $hybrid : '' ?>"
-                                            style="<?= ragHeatStyle($hybrid) ?>"
-                                        >
-                                            <?= $hybrid !== null ? number_format($hybrid, 4) : '-' ?>
-                                        </td>
-                                        <td class="snippet-cell">
-                                            <?= htmlspecialchars($snippet) ?>
-                                        </td>
-                                        <td class="text-end">
-                                            <button
-                                                class="btn btn-outline-secondary btn-sm"
-                                                type="button"
-                                                data-bs-toggle="collapse"
-                                                data-bs-target="#<?= $detailId ?>"
-                                                aria-expanded="false"
-                                                aria-controls="<?= $detailId ?>"
-                                            >
-                                                Details
-                                            </button>
-                                        </td>
-                                    </tr>
-                                    <tr data-row-type="detail">
-                                        <td colspan="6">
-                                            <div class="collapse" id="<?= $detailId ?>">
-                                                <div class="border rounded p-3 bg-light">
-                                                    <div class="mb-2">
-                                                        <strong>Source:</strong>
-                                                        <?= htmlspecialchars($r['source'] ?? '') ?>
-                                                    </div>
-                                                    <?php if (!empty($r['meta_summary'])): ?>
-                                                        <div class="mb-2">
-                                                            <strong>Meta summary:</strong><br>
-                                                            <span class="small">
-                                                                <?= nl2br(htmlspecialchars($r['meta_summary'])) ?>
-                                                            </span>
-                                                        </div>
-                                                    <?php endif; ?>
-                                                    <?php if (!empty($r['meta_tags'])): ?>
-                                                        <div class="mb-2">
-                                                            <strong>Meta tags:</strong>
-                                                            <span class="badge bg-secondary">
-                                                                <?= htmlspecialchars($r['meta_tags']) ?>
-                                                            </span>
-                                                        </div>
-                                                    <?php endif; ?>
-                                                    <?php if (!empty($r['meta_timestamp'])): ?>
-                                                        <div class="mb-2">
-                                                            <strong>Timestamp:</strong>
-                                                            <?= htmlspecialchars($r['meta_timestamp']) ?>
-                                                        </div>
-                                                    <?php endif; ?>
-                                                    <div class="mb-0">
-                                                        <strong>Full content:</strong><br>
-                                                        <pre class="small mb-0" style="white-space: pre-wrap;"><?= htmlspecialchars($r['content'] ?? '') ?></pre>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </td>
-                                    </tr>
-                                <?php endforeach; ?>
-                                </tbody>
-                            </table>
                         </div>
-                    <?php else: ?>
+                        <button type="submit" class="btn btn-primary">
+                            Upload &amp; Ingest
+                        </button>
+                    </form>
+
+                    <h6>JSON File Template (Minimal Structure)</h6>
+                    <pre class="border rounded p-2 bg-light small-pre">
+{
+  "documents": [
+    {
+      "doc_id": "doc_manual_001",
+      "source": {
+        "type": "url",
+        "uri": "https://example.com/page.html"
+      },
+      "sections": [
+        {
+          "section_id": "sec_001",
+          "text": "Your section content goes here..."
+        },
+        {
+          "section_id": "sec_002",
+          "text": "Another section with more content..."
+        }
+      ]
+    }
+  ]
+}
+                    </pre>
+                    <p class="small text-muted mb-0">
+                        <strong>Note:</strong> Each section becomes a separate RAG document.
+                        You can include multiple documents in the "documents" array.
+                    </p>
+
+                    <?php if (!empty($ingestLog)): ?>
                         <div class="alert alert-secondary mt-3 mb-0">
-                            No matches returned for this query.
+                            <pre class="small-pre mb-0"><?= htmlspecialchars($ingestLog) ?></pre>
                         </div>
                     <?php endif; ?>
-                <?php endif; ?>
+                </div>
             </div>
         </div>
 
-        <!-- Purge namespace card -->
-<!--        <div class="card mb-4 border-danger">-->
-<!--            <div class="card-header bg-danger text-white">-->
-<!--                Purge Namespace-->
-<!--            </div>-->
-<!--            <div class="card-body">-->
-<!--                <p class="mb-2">-->
-<!--                    This will permanently delete all context vectors for-->
-<!--                    <strong>--><?php //= htmlspecialchars($projectIdentifier) ?><!--</strong>.-->
-<!--                </p>-->
-<!--                <p class="small text-muted">-->
-<!--                    Type the namespace exactly to confirm.-->
-<!--                </p>-->
-<!--                <form class="row g-3" method="post">-->
-<!--                    <input type="hidden" name="redcap_csrf_token" value="--><?php //= $module->getCSRFToken() ?><!--">-->
-<!--                    <input type="hidden" name="action" value="purge">-->
-<!--                    <input type="hidden" name="project_identifier" value="--><?php //= htmlspecialchars($projectIdentifier) ?><!--">-->
-<!---->
-<!--                    <div class="col-md-4 col-lg-3">-->
-<!--                        <input-->
-<!--                            type="text"-->
-<!--                            class="form-control"-->
-<!--                            name="confirm"-->
-<!--                            placeholder="--><?php //= htmlspecialchars($projectIdentifier) ?><!--"-->
-<!--                        >-->
-<!--                    </div>-->
-<!--                    <div class="col-md-3">-->
-<!--                        <button-->
-<!--                            type="submit"-->
-<!--                            class="btn btn-outline-danger"-->
-<!--                            onclick="return confirm('Delete all vectors for this namespace?');"-->
-<!--                        >-->
-<!--                            Purge All-->
-<!--                        </button>-->
-<!--                    </div>-->
-<!--                </form>-->
-<!--            </div>-->
-<!--        </div>-->
+        <!-- Search / Debug Tab -->
+        <div
+            class="tab-pane fade <?= $activeTab === 'search' ? 'show active' : '' ?>"
+            id="pane-search"
+            role="tabpanel"
+            aria-labelledby="tab-search"
+        >
+            <div class="card shadow-sm">
+                <div class="card-header">
+                    <strong>Vector Search Test</strong>
+                </div>
+                <div class="card-body">
+                    <form method="post" class="row g-2 align-items-center mb-2">
+                        <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
+                        <input type="hidden" name="action" value="search">
+                        <div class="col-12 col-md-9">
+                            <input
+                                type="text"
+                                name="query"
+                                class="form-control"
+                                placeholder="Enter test query text"
+                                value="<?= isset($_POST['query']) && $action === 'search'
+                                    ? htmlspecialchars($_POST['query'])
+                                    : '' ?>"
+                            >
+                        </div>
+                        <div class="col-12 col-md-3 d-grid">
+                            <button type="submit" class="btn btn-primary">
+                                Run Search
+                            </button>
+                        </div>
+                    </form>
 
-        <!-- Stored documents list -->
-        <div class="card h-100 d-flex flex-column" style="height: calc(100vh - 600px) !important;">
-            <div class="card-header">
-                Stored Documents (<?= count($rows) ?>)
+                    <?php if (is_array($results)): ?>
+                        <hr class="mt-3 mb-2">
+                        <h6 class="fw-semibold">
+                            Search Results
+                            <?php if (!empty($_POST['query']) && $action === 'search'): ?>
+                                <small class="text-muted">
+                                    for "<?= htmlspecialchars($_POST['query']) ?>"
+                                </small>
+                            <?php endif; ?>
+                        </h6>
+
+                        <?php if (count($results)): ?>
+                            <div class="table-responsive mt-2">
+                                <table class="table table-sm table-hover table-fixed-header align-middle mb-0" id="results-table">
+                                    <thead>
+                                    <tr>
+                                        <th data-sort-key="id" data-sort-type="string">ID</th>
+                                        <th data-sort-key="dense" data-sort-type="number">Dense</th>
+                                        <th data-sort-key="sparse" data-sort-type="number">Sparse</th>
+                                        <th data-sort-key="similarity" data-sort-type="number">Similarity</th>
+                                        <th>Content (first 140 chars)</th>
+                                    </tr>
+                                    </thead>
+                                    <tbody>
+                                    <?php foreach ($results as $r): ?>
+                                        <?php
+                                        $dense      = isset($r['dense']) ? (float)$r['dense'] : null;
+                                        $sparse     = isset($r['sparse']) ? (float)$r['sparse'] : null;
+                                        $similarity = isset($r['similarity']) ? (float)$r['similarity'] : null;
+                                        ?>
+                                        <tr
+                                            data-id="<?= htmlspecialchars($r['id']) ?>"
+                                            data-dense="<?= $dense !== null ? $dense : '' ?>"
+                                            data-sparse="<?= $sparse !== null ? $sparse : '' ?>"
+                                            data-similarity="<?= $similarity !== null ? $similarity : '' ?>"
+                                        >
+                                            <td class="small text-monospace">
+                                                <?= htmlspecialchars($r['id']) ?>
+                                            </td>
+                                            <td class="<?= ragScoreClass($dense) ?>">
+                                                <?= $dense !== null ? round($dense, 4) : '-' ?>
+                                            </td>
+                                            <td class="<?= ragScoreClass($sparse) ?>">
+                                                <?= $sparse !== null ? round($sparse, 4) : '-' ?>
+                                            </td>
+                                            <td class="<?= ragScoreClass($similarity) ?>">
+                                                <?= $similarity !== null ? round($similarity, 4) : '-' ?>
+                                            </td>
+                                            <td class="small">
+                                                <?= htmlspecialchars(substr($r['content'], 0, 140)) ?>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        <?php else: ?>
+                            <div class="alert alert-secondary mt-3 mb-0">No matches.</div>
+                        <?php endif; ?>
+                    <?php endif; ?>
+                </div>
             </div>
-            <div class="card-body overflow-auto">
-                <?php if (count($rows)): ?>
-                    <div class="table-responsive">
-                        <table
-                            id="docsTable"
-                            class="table table-sm table-hover align-middle"
-                            data-sortable-table="1"
-                        >
-                            <thead class="table-light">
-                            <tr>
-                                <th scope="col" class="sortable" data-sort-key="id">ID</th>
-                                <th scope="col" class="sortable" data-sort-key="source">Source</th>
-                                <th scope="col">Content snippet</th>
-                                <th scope="col" style="width: 1%;"></th>
-                            </tr>
-                            </thead>
-                            <tbody>
-                            <?php foreach ($rows as $idx => $r): ?>
-                                <?php
-                                $docId    = $r['id'] ?? '';
-                                $snippet  = mb_substr($r['content'] ?? '', 0, 180);
-                                $detailId = 'doc-detail-' . $idx;
-                                ?>
-                                <tr data-row-type="summary">
-                                    <td
-                                        class="text-monospace small"
-                                        data-sort-field="id"
-                                        data-sort-value="<?= htmlspecialchars($docId) ?>"
+        </div>
+
+        <!-- Docs / Purge Tab -->
+        <div
+            class="tab-pane fade <?= $activeTab === 'docs' ? 'show active' : '' ?>"
+            id="pane-docs"
+            role="tabpanel"
+            aria-labelledby="tab-docs"
+        >
+            <div class="row g-3">
+                <div class="col-12">
+                    <div class="card shadow-sm mb-3">
+                        <div class="card-header">
+                            <strong>Namespace Maintenance</strong>
+                        </div>
+                        <div class="card-body">
+                            <form method="post" class="row g-2 align-items-center">
+                                <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
+                                <input type="hidden" name="action" value="purge">
+                                <div class="col-12 col-md-7 small">
+                                    <label class="form-label mb-1">
+                                        Type the namespace to purge all vectors:
+                                    </label>
+                                    <input
+                                        type="text"
+                                        name="confirm"
+                                        class="form-control form-control-sm"
+                                        placeholder="<?= htmlspecialchars($projectIdentifier) ?>"
                                     >
-                                        <?= htmlspecialchars($docId) ?>
-                                    </td>
-                                    <td
-                                        data-sort-field="source"
-                                        data-sort-value="<?= htmlspecialchars($r['source'] ?? '') ?>"
+                                </div>
+                                <div class="col-12 col-md-5 d-grid mt-3 mt-md-4">
+                                    <button
+                                        type="submit"
+                                        class="btn btn-outline-danger btn-sm"
+                                        onclick="return confirm('This will delete all vectors in this namespace. Continue?');"
                                     >
-                                        <?= htmlspecialchars($r['source'] ?? '') ?>
-                                    </td>
-                                    <td class="snippet-cell">
-                                        <?= htmlspecialchars($snippet) ?>
-                                    </td>
-                                    <td class="text-end">
-                                        <div class="btn-group btn-group-sm" role="group">
-                                            <button
-                                                class="btn btn-outline-secondary"
-                                                type="button"
-                                                data-bs-toggle="collapse"
-                                                data-bs-target="#<?= $detailId ?>"
-                                                aria-expanded="false"
-                                                aria-controls="<?= $detailId ?>"
-                                            >
-                                                Details
-                                            </button>
-                                            <form method="post" onsubmit="return confirm('Delete this document?');">
-                                                <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
-                                                <input type="hidden" name="action" value="delete">
-                                                <input type="hidden" name="project_identifier" value="<?= htmlspecialchars($projectIdentifier) ?>">
-                                                <input type="hidden" name="doc_id" value="<?= htmlspecialchars($docId) ?>">
-                                                <button type="submit" class="btn btn-outline-danger">
-                                                    Delete
-                                                </button>
-                                            </form>
-                                        </div>
-                                    </td>
-                                </tr>
-                                <tr data-row-type="detail">
-                                    <td colspan="4">
-                                        <div class="collapse" id="<?= $detailId ?>">
-                                            <div class="border rounded p-3 bg-light">
-                                                <div class="mb-2">
-                                                    <strong>Source:</strong>
-                                                    <?= htmlspecialchars($r['source'] ?? '') ?>
-                                                </div>
-                                                <?php if (!empty($r['meta_summary'])): ?>
-                                                    <div class="mb-2">
-                                                        <strong>Meta summary:</strong><br>
-                                                        <span class="small">
-                                                            <?= nl2br(htmlspecialchars($r['meta_summary'])) ?>
-                                                        </span>
-                                                    </div>
-                                                <?php endif; ?>
-                                                <?php if (!empty($r['meta_tags'])): ?>
-                                                    <div class="mb-2">
-                                                        <strong>Meta tags:</strong>
-                                                        <span class="badge bg-secondary">
-                                                            <?= htmlspecialchars($r['meta_tags']) ?>
-                                                        </span>
-                                                    </div>
-                                                <?php endif; ?>
-                                                <?php if (!empty($r['meta_timestamp'])): ?>
-                                                    <div class="mb-2">
-                                                        <strong>Timestamp:</strong>
-                                                        <?= htmlspecialchars($r['meta_timestamp']) ?>
-                                                    </div>
-                                                <?php endif; ?>
-                                                <div class="mb-0">
-                                                    <strong>Full content:</strong><br>
-                                                    <pre class="small mb-0" style="white-space: pre-wrap;"><?= htmlspecialchars($r['content'] ?? '') ?></pre>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </td>
-                                </tr>
-                            <?php endforeach; ?>
-                            </tbody>
-                        </table>
+                                        Purge Namespace
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
                     </div>
-                <?php else: ?>
-                    <p class="text-muted mb-0">
-                        No stored context documents found for this namespace.
-                    </p>
-                <?php endif; ?>
+                </div>
+
+                <div class="col-12">
+                    <div class="card shadow-sm">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <strong>Stored Documents</strong>
+                            <span class="badge bg-light text-dark">
+                                <?= count($rows) ?> records
+                            </span>
+                        </div>
+                        <div class="card-body p-0">
+                            <?php if (count($rows)): ?>
+                                <div class="table-responsive" style="max-height: 420px;">
+                                    <table class="table table-sm table-hover table-fixed-header align-middle mb-0" id="docs-table">
+                                        <thead>
+                                        <tr>
+                                            <th data-sort-key="id" data-sort-type="string">ID</th>
+                                            <th data-sort-key="source" data-sort-type="string">Source</th>
+                                            <th>Content</th>
+                                            <th style="width:130px;">Actions</th>
+                                        </tr>
+                                        </thead>
+                                        <tbody>
+                                        <?php foreach ($rows as $idx => $r): ?>
+                                            <?php
+                                            $rowId      = htmlspecialchars($r['id']);
+                                            $collapseId = 'docDetails_' . $idx;
+                                            ?>
+                                            <tr
+                                                data-id="<?= $rowId ?>"
+                                                data-source="<?= htmlspecialchars($r['source'] ?? '') ?>"
+                                            >
+                                                <td class="small text-monospace"><?= $rowId ?></td>
+                                                <td><?= htmlspecialchars($r['source'] ?? '') ?></td>
+                                                <td class="content-preview small">
+                                                    <?= htmlspecialchars(substr($r['content'], 0, 120)) ?>
+                                                </td>
+                                                <td>
+                                                    <div class="btn-group btn-group-sm" role="group">
+                                                        <button
+                                                            type="button"
+                                                            class="btn btn-outline-secondary toggle-details"
+                                                            data-bs-target="#<?= $collapseId ?>"
+                                                        >
+                                                            View
+                                                        </button>
+                                                        <form method="post" style="display:inline;">
+                                                            <input type="hidden" name="action" value="delete">
+                                                            <input type="hidden" name="redcap_csrf_token" value="<?= $module->getCSRFToken() ?>">
+                                                            <input type="hidden" name="doc_id" value="<?= $rowId ?>">
+                                                            <button
+                                                                type="submit"
+                                                                class="btn btn-outline-danger"
+                                                                onclick="return confirm('Delete this document from the namespace?');"
+                                                            >
+                                                                Delete
+                                                            </button>
+                                                        </form>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                            <tr class="table-light">
+                                                <td colspan="4" class="p-0">
+                                                    <div
+                                                        id="<?= $collapseId ?>"
+                                                        class="collapse border-top small px-3 py-2"
+                                                    >
+                                                        <div class="fw-semibold mb-1">Full Content</div>
+                                                        <pre class="mb-2" style="white-space:pre-wrap; font-size:11px;"><?= htmlspecialchars($r['content']) ?></pre>
+                                                        <div class="text-muted small">
+                                                            <strong>Source:</strong> <?= htmlspecialchars($r['source'] ?? '') ?>
+                                                            <?php if (!empty($r['meta_timestamp'])): ?>
+                                                                &nbsp; | &nbsp;
+                                                                <strong>Timestamp:</strong> <?= htmlspecialchars($r['meta_timestamp']) ?>
+                                                            <?php endif; ?>
+                                                        </div>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            <?php else: ?>
+                                <div class="p-3">
+                                    <em class="text-muted">No stored context documents.</em>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
-    <?php endif; ?>
+    </div><!-- /.tab-content -->
+</div><!-- /.container-fluid -->
 
-</div>
-
-<!-- Bootstrap 5 (JS bundle) -->
+<!-- Bootstrap JS bundle -->
 <script
     src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
     integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
     crossorigin="anonymous"
 ></script>
+
 <script>
-    document.addEventListener('DOMContentLoaded', function () {
-        const tooltipTriggerList = [].slice.call(
-            document.querySelectorAll('[data-bs-toggle="tooltip"]')
-        );
-
-        tooltipTriggerList.forEach(el => {
-            new bootstrap.Tooltip(el);
-        });
-
-        const form = document.getElementById('searchForm');
-        const runBtn = document.getElementById('runSearchBtn');
-        const btnSpinner = document.getElementById('btnSpinner');
-        const btnText = document.getElementById('btnText');
-
-        if (!form || !runBtn || !btnSpinner || !btnText) {
-            console.warn('Search spinner elements not found');
-            return;
+// Tab persistence via URL hash
+document.addEventListener('DOMContentLoaded', function () {
+    const hash = window.location.hash;
+    if (hash) {
+        const trigger = document.querySelector(`#ragTab [data-bs-target="${hash}"]`);
+        if (trigger) {
+            const tab = new bootstrap.Tab(trigger);
+            tab.show();
         }
+    }
 
-        form.addEventListener('submit', function () {
-            runBtn.disabled = true;
-            btnSpinner.classList.remove('d-none');
-            btnText.textContent = 'Running…';
+    document.querySelectorAll('#ragTab [data-bs-toggle="tab"]').forEach(function (btn) {
+        btn.addEventListener('shown.bs.tab', function (event) {
+            const target = event.target.getAttribute('data-bs-target');
+            if (target) {
+                history.replaceState(null, '', target);
+            }
         });
     });
-</script>
 
-<script>
-// Simple client-side table sorting with support for summary/detail row pairs
-(function () {
-    function getCellValue(row, key) {
-        var cell = row.querySelector('[data-sort-field="' + key + '"]');
-        if (!cell) return '';
-        var val = cell.getAttribute('data-sort-value');
-        if (val === null) {
-            val = cell.textContent || '';
-        }
-        return val.trim();
-    }
+    // Simple table sorting for any table with th[data-sort-key]
+    document.querySelectorAll('th[data-sort-key]').forEach(function (th) {
+        th.addEventListener('click', function () {
+            const table   = th.closest('table');
+            const tbody   = table.querySelector('tbody');
+            const key     = th.dataset.sortKey;
+            const isNumeric = th.dataset.sortType === 'number';
+            const currentDir = th.dataset.sortDir || 'asc';
+            const newDir     = currentDir === 'asc' ? 'desc' : 'asc';
+            th.dataset.sortDir = newDir;
 
-    function isNumeric(val) {
-        return val !== '' && !isNaN(val) && isFinite(val);
-    }
+            const rows = Array.from(tbody.querySelectorAll('tr')).filter(function (row) {
+                // Skip detail rows in docs table
+                return !row.querySelector('.collapse');
+            });
 
-    function attachSorting(table) {
-        var headers = table.querySelectorAll('thead th[data-sort-key]');
-        if (!headers.length) return;
+            rows.sort(function (a, b) {
+                const aVal = a.dataset[key] || '';
+                const bVal = b.dataset[key] || '';
 
-        headers.forEach(function (th) {
-            th.classList.add('sortable');
-            th.addEventListener('click', function () {
-                var key = th.getAttribute('data-sort-key');
-                var tbody = table.querySelector('tbody');
-                if (!tbody) return;
+                let cmp;
+                if (isNumeric) {
+                    const aNum = parseFloat(aVal) || 0;
+                    const bNum = parseFloat(bVal) || 0;
+                    cmp = aNum - bNum;
+                } else {
+                    cmp = aVal.localeCompare(bVal);
+                }
 
-                // Determine new sort direction
-                var currentDir = th.getAttribute('data-sort-dir') || 'none';
-                var newDir = currentDir === 'asc' ? 'desc' : 'asc';
-                th.setAttribute('data-sort-dir', newDir);
+                return newDir === 'asc' ? cmp : -cmp;
+            });
 
-                // Reset indicators on siblings
-                headers.forEach(function (h) {
-                    if (h !== th) {
-                        h.removeAttribute('data-sort-dir');
-                        h.classList.remove('sort-asc', 'sort-desc');
-                    }
-                });
-                th.classList.toggle('sort-asc', newDir === 'asc');
-                th.classList.toggle('sort-desc', newDir === 'desc');
-
-                // Collect summary rows and their detail companions (if any)
-                var summaries = Array.prototype.slice.call(
-                    tbody.querySelectorAll('tr[data-row-type="summary"]')
-                );
-
-                var pairs = summaries.map(function (summary) {
-                    var detail = summary.nextElementSibling;
-                    if (detail && detail.getAttribute('data-row-type') === 'detail') {
-                        return { summary: summary, detail: detail };
-                    }
-                    return { summary: summary, detail: null };
-                });
-
-                pairs.sort(function (a, b) {
-                    var av = getCellValue(a.summary, key);
-                    var bv = getCellValue(b.summary, key);
-
-                    var aNum = isNumeric(av) ? parseFloat(av) : null;
-                    var bNum = isNumeric(bv) ? parseFloat(bv) : null;
-
-                    var cmp;
-                    if (aNum !== null && bNum !== null) {
-                        cmp = aNum - bNum;
-                    } else {
-                        cmp = av.localeCompare(bv);
-                    }
-
-                    return newDir === 'asc' ? cmp : -cmp;
-                });
-
-                // Re-append in new order
-                pairs.forEach(function (pair) {
-                    tbody.appendChild(pair.summary);
-                    if (pair.detail) {
-                        tbody.appendChild(pair.detail);
-                    }
-                });
+            rows.forEach(function (row) {
+                tbody.insertBefore(row, tbody.firstChild);
             });
         });
-    }
-
-    document.addEventListener('DOMContentLoaded', function () {
-        var tables = document.querySelectorAll('table[data-sortable-table="1"]');
-        tables.forEach(attachSorting);
     });
-})();
+
+    // Collapsible "View" buttons for stored docs
+    document.querySelectorAll('.toggle-details').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            const targetId = btn.getAttribute('data-bs-target');
+            if (!targetId) return;
+            const el = document.querySelector(targetId);
+            if (!el) return;
+            const c = bootstrap.Collapse.getOrCreateInstance(el);
+            c.toggle();
+        });
+    });
+});
 </script>
 
 </body>
