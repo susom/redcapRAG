@@ -51,6 +51,14 @@
 		"storeDocument": {
 			"description": "Store a single document/section to RAG vector database",
 			"access": ["auth"]
+		},
+		"deleteDocument": {
+			"description": "Delete a document from RAG vector database (both dense and sparse indexes)",
+			"access": ["auth"]
+		},
+		"purgeNamespace": {
+			"description": "Purge all documents in a namespace (both dense and sparse indexes)",
+			"access": ["auth"]
 		}
 	},
 

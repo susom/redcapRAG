@@ -405,7 +405,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                 ]);
 
                 $this->emDebug("Pinecone upserted chunk $contentHash in namespace $namespace");
-                return true;
+                return $contentHash;  // Return hash (Pinecone vector ID) instead of just true
             } catch (\Exception $e) {
                 $errorMsg = "Failed to upsert to Pinecone: " . $e->getMessage();
                 $this->emError($errorMsg);
@@ -422,7 +422,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
                 if ($result->num_rows > 0) {
                     $this->emDebug("Document already exists in Entity Table for project {$projectIdentifier}. Skipping.");
-                    return true; // Skip storing duplicate (consider this success)
+                    return $contentHash; // Return hash even for duplicates
                 }
 
                 $entityFactory = $this->getEntityFactory();
@@ -457,7 +457,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                     try {
                         if ($entity->save()) {
                             // $this->emDebug("Entity saved successfully.", $entity->getData());
-                            return true;
+                            return $contentHash;  // Return hash instead of true
                         } else {
                             $errorMsg = "Entity save failed (no exception thrown)";
                             $this->emError($errorMsg);
@@ -1386,7 +1386,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
 
                 // Attempt to store document
                 $errorMsg = null;
-                $success = $this->storeDocument(
+                $vectorId = $this->storeDocument(
                     $namespace,
                     $title,
                     $text,
@@ -1395,12 +1395,14 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                     $metadata
                 );
 
-                if ($success) {
+                if ($vectorId) {
+                    // storeDocument() now returns the vector_id (content hash)
                     return [
                         "status"  => 200,
                         "body"    => json_encode([
                             "status" => "success",
                             "namespace" => $namespace,
+                            "vector_id" => $vectorId,
                             "title" => $title,
                             "message" => "Document stored successfully"
                         ]),
@@ -1414,6 +1416,87 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
                             "namespace" => $namespace,
                             "title" => $title,
                             "error" => $errorMsg ?? "Failed to store document (unknown error)"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                }
+
+            case "deleteDocument":
+                $vector_id = $payload['vector_id'] ?? null;
+
+                // Validate required field
+                if (!$vector_id) {
+                    return [
+                        "status"  => 400,
+                        "body"    => json_encode([
+                            "status" => "error",
+                            "error" => "Missing required field: vector_id"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                }
+
+                // Delete from both dense and sparse indexes
+                $success = $this->deleteContextDocument($namespace, $vector_id);
+
+                if ($success) {
+                    return [
+                        "status"  => 200,
+                        "body"    => json_encode([
+                            "status" => "success",
+                            "namespace" => $namespace,
+                            "vector_id" => $vector_id,
+                            "message" => "Document deleted successfully from both dense and sparse indexes"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                } else {
+                    return [
+                        "status"  => 500,
+                        "body"    => json_encode([
+                            "status" => "error",
+                            "namespace" => $namespace,
+                            "vector_id" => $vector_id,
+                            "error" => "Failed to delete document"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                }
+
+            case "purgeNamespace":
+                // Dangerous operation - require confirmation
+                $confirm = $payload['confirm'] ?? null;
+
+                if ($confirm !== "yes") {
+                    return [
+                        "status"  => 400,
+                        "body"    => json_encode([
+                            "status" => "error",
+                            "error" => "Must set confirm=yes to purge namespace (safety check)"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                }
+
+                $success = $this->purgeContextNamespace($namespace);
+
+                if ($success) {
+                    return [
+                        "status"  => 200,
+                        "body"    => json_encode([
+                            "status" => "success",
+                            "namespace" => $namespace,
+                            "message" => "Namespace purged successfully (both dense and sparse indexes)"
+                        ]),
+                        "headers" => ["Content-Type" => "application/json"]
+                    ];
+                } else {
+                    return [
+                        "status"  => 500,
+                        "body"    => json_encode([
+                            "status" => "error",
+                            "namespace" => $namespace,
+                            "error" => "Failed to purge namespace"
                         ]),
                         "headers" => ["Content-Type" => "application/json"]
                     ];
