@@ -157,7 +157,7 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
     private function getEmbedding($text, &$errorMsg = null) {
         try {
             // Call the embedding API
-            $result = $this->getSecureChatInstance()->callAI("ada-002", array("input" => $text));
+            $result = $this->getSecureChatInstance()->callAI("text-embedding-3-small", array("input" => $text));
 
             // Log the response for debugging
             // $this->emDebug("API response for embedding:", $result);
