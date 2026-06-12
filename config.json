@@ -71,7 +71,7 @@
 		},
 		{
 			"key": "rag_target_namespace",
-			"name": "<b>REXI RAG target Namespace</b><br><i>Pinecone namespace used for REXI RAG ingestion. (SPECIAL USE CASE)</i>",
+			"name": "<b>RAG Namespace Override</b><br><i>Pinecone namespace for this project. Leave blank to use the default: <code>project_{project_id}</code></i>",
 			"required": false,
 			"type": "text"
 		}
