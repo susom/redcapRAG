@@ -1350,8 +1350,13 @@ class RedcapRAG extends \ExternalModules\AbstractExternalModule {
             $payload = (json_last_error() === JSON_ERROR_NONE) ? $decoded : $_POST;
         }
 
-        // Determine namespace from project settings (token provides project context)
-        $namespace = $this->getProjectSetting('rag_target_namespace');
+        // Determine namespace. Precedence:
+        //   1. Explicit namespace in the request payload (caller override)
+        //   2. Project setting 'rag_target_namespace' (token provides project context)
+        //   3. Fallback to "project_{project_id}" or "default"
+        $namespace = !empty($payload['namespace'])
+            ? $payload['namespace']
+            : $this->getProjectSetting('rag_target_namespace');
         if (!$namespace) {
             // Fallback to project ID if no namespace configured
             $project_id = $this->getProjectId();
